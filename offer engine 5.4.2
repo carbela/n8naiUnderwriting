@@ -1,0 +1,2382 @@
+/******************************************************
+ OFFER ENGINE v5.4.2 - ORIGINAL WORKFLOW PATCHED
+ -----------------------------------------------------
+ Changes:
+  - Creative offers solve to minimum 1.27 DSCR
+  - Solver uses 1.275 DSCR buffer to avoid rounding misses
+  - Primary and backup cannot differ only by balloon term
+  - Backup prioritizes stronger CF / CoC / DSCR
+  - Cash offer uses original ARV table
+  - Cash MAO does NOT deduct repairs unless transcript/listing confirms repairs
+  - Cash MAO does NOT deduct closing costs
+  - Rehab / acquisition cost / seller agent fee shown for closer reference
+  - Pass-through fields preserved for downstream nodes
+******************************************************/
+
+const ENGINE_VERSION = 'offer-engine-v5.6.1-padsplit-mandate';
+
+const defaultPolicy = {
+    target_dscr: 1.28,
+    target_dscr_solve_buffer: 1.285,
+
+    families: {
+        subto: {
+            equity_max_pct: 20,
+            max_unresolved_equity: 2500,
+            min_dscr_hard: 1.28,
+            min_dscr_target: 1.28,
+            min_monthly_cf_hard: -50,
+            min_monthly_cf_target: 150,
+            max_entry_pct: 15,
+            max_rate_pct_small_balance: 8,
+            max_rate_pct_large_balance: 5,
+            large_balance_cutoff: 150000,
+            low_rate_exception_pct: 3.5
+        },
+        hybrid: {
+            equity_min_pct: 20,
+            equity_max_pct: 85,
+            min_dscr_hard: 1.28,
+            min_dscr_target: 1.28,
+            min_monthly_cf_hard: 0,
+            min_monthly_cf_target: 200,
+            min_coc_target: 9,
+            max_entry_pct: 15,
+            max_cts_pct: 10,
+            allowed_rates: [4.0, 3.5, 3.0],
+            allowed_balloons: [5, 7],
+            amort_years: 30
+        },
+        seller_finance: {
+            equity_min_pct: 85,
+            min_dscr_hard: 1.28,
+            min_dscr_target: 1.28,
+            min_monthly_cf_hard: 0,
+            min_monthly_cf_target: 200,
+            min_coc_target: 9,
+            max_down_pct: 10,
+            max_entry_pct: 15,
+            allowed_rates: [4.0, 3.5, 3.0],
+            allowed_balloons: [5, 7],
+            amort_years: 30,
+            allowed_down_pcts: [10, 8, 5]
+        }
+    },
+
+    mandates: {
+        cashflow: {
+            min_dscr_target: 1.28,
+            min_monthly_cf_target: 200,
+            min_coc_target: 9,
+            min_dscr_hard: 1.28,
+            min_monthly_cf_hard: -100,
+            max_entry_pct: 15
+        },
+        brrrr: {
+            min_instant_equity_pct: 12,
+            min_arv_spread_pct: 20,
+            max_all_in_to_arv_pct: 0.78,
+            min_dscr_hard: 0.90,
+            min_monthly_cf_hard: -150,
+            max_entry_pct: 15
+        },
+        padsplit: {
+            require_padsplit_viable: true,
+            min_dscr_target: 1.80,
+            min_monthly_cf_target: 300,
+            min_coc_target: 15,
+            min_dscr_hard: 1.28,
+            min_monthly_cf_hard: 200,
+            max_entry_pct: 15,
+            standard_room_rate_default: 850,
+            ensuite_room_rate_default: 1150,
+            vacancy_rate: 0.12,
+            mgmt_rate: 0.18,
+            maint_rate: 0.09,
+            default_monthly_utilities: 450,
+            default_monthly_cleaning: 100,
+            default_monthly_turn_reserve: 75
+        }
+    },
+
+    economics: {
+        buy_box_pct: 0.70,
+        buyer_acquisition_cost_rate: 0.05,
+        mgmt_rate: 0.08,
+        maint_rate: 0.05,
+        vacancy_rate: 0.05,
+        assignment_pct_of_entry: 0.25,
+        wholesale_assignment_fee: 15000,
+        agent_commission_rate: 0.03,
+        seller_closing_cost_rate: 0.015,
+        cts_hard_cap_pct: 0.15
+    },
+
+    structure: {
+        purchase_gap_tolerance: 2500,
+        overfund_tolerance: 2500
+    },
+
+    fallback: {
+        enabled: true,
+        seller_facing_allowed: false
+    },
+
+    output: {
+        include_debug: true,
+        include_all_candidates: false
+    }
+};
+
+const investorProfiles = {
+    balanced: {
+        name: 'balanced',
+        mandate: 'cashflow',
+        weights: {
+            dscr: 0.25,
+            cashFlow: 0.30,
+            coc: 0.15,
+            entry: 0.20,
+            complexity: 0.05,
+            confidence: 0.05,
+            instantEquity: 0,
+            arvSpread: 0,
+            padsplitUpside: 0
+        }
+    },
+    yield: {
+        name: 'yield',
+        mandate: 'cashflow',
+        weights: {
+            dscr: 0.20,
+            cashFlow: 0.35,
+            coc: 0.20,
+            entry: 0.10,
+            complexity: 0.05,
+            confidence: 0.10,
+            instantEquity: 0,
+            arvSpread: 0,
+            padsplitUpside: 0
+        }
+    },
+    low_entry: {
+        name: 'low_entry',
+        mandate: 'cashflow',
+        weights: {
+            dscr: 0.15,
+            cashFlow: 0.20,
+            coc: 0.10,
+            entry: 0.40,
+            complexity: 0.05,
+            confidence: 0.10,
+            instantEquity: 0,
+            arvSpread: 0,
+            padsplitUpside: 0
+        }
+    },
+    brrrr: {
+        name: 'brrrr',
+        mandate: 'brrrr',
+        weights: {
+            dscr: 0.10,
+            cashFlow: 0.10,
+            coc: 0.05,
+            entry: 0.25,
+            complexity: 0.05,
+            confidence: 0.10,
+            instantEquity: 0.20,
+            arvSpread: 0.15,
+            padsplitUpside: 0
+        }
+    },
+    padsplit: {
+        name: 'padsplit',
+        mandate: 'padsplit',
+        weights: {
+            dscr: 0.15,
+            cashFlow: 0.20,
+            coc: 0.10,
+            entry: 0.15,
+            complexity: 0.05,
+            confidence: 0.10,
+            instantEquity: 0.05,
+            arvSpread: 0.05,
+            padsplitUpside: 0.15
+        }
+    }
+};
+
+function isNil(v) {
+    return v === null || v === undefined;
+}
+
+function num(v) {
+    if (isNil(v) || v === '') return 0;
+    if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    const n = Number(String(v).replace(/[^\d.-]/g, '').trim());
+    return Number.isFinite(n) ? n : 0;
+}
+
+function txt(v) {
+    return String(v ?? '').trim();
+}
+
+function lower(v) {
+    return txt(v).toLowerCase();
+}
+
+function round(n, digits = 0) {
+    const p = Math.pow(10, digits);
+    return Math.round((Number(n) || 0) * p) / p;
+}
+
+function clamp(v, min, max) {
+    return Math.min(max, Math.max(min, v));
+}
+
+function money(n, digits = 0) {
+    const v = Number.isFinite(Number(n)) ? Number(n) : 0;
+    return `$${v.toLocaleString('en-US', {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+    })}`;
+}
+
+function moneyOrNull(n, digits = 0) {
+    if (n === null || n === undefined) return null;
+    return money(num(n), digits);
+}
+
+function pct(n, digits = 1) {
+    const v = Number.isFinite(Number(n)) ? Number(n) : 0;
+    return `${v.toFixed(digits)}%`;
+}
+
+function pctOrNull(n, digits = 1) {
+    if (n === null || n === undefined) return null;
+    return pct(num(n), digits);
+}
+
+function pmt(rateAnnualPct, years, principal) {
+    const P = Number(principal) || 0;
+    const y = Number(years) || 0;
+    const r = (Number(rateAnnualPct) || 0) / 100 / 12;
+    const n = y * 12;
+    if (P <= 0 || n <= 0) return 0;
+    if (r === 0) return P / n;
+    return (P * r) / (1 - Math.pow(1 + r, -n));
+}
+
+function pvFromPayment(rateAnnualPct, years, monthlyPayment) {
+    const payment = Number(monthlyPayment) || 0;
+    const y = Number(years) || 0;
+    const r = (Number(rateAnnualPct) || 0) / 100 / 12;
+    const n = y * 12;
+    if (payment <= 0 || n <= 0) return 0;
+    if (r === 0) return payment * n;
+    return payment * (1 - Math.pow(1 + r, -n)) / r;
+}
+
+function maxMonthlyPIForTargetDSCR(noi, targetDSCR) {
+    const n = num(noi);
+    const d = num(targetDSCR);
+    if (n <= 0 || d <= 0) return 0;
+    return (n / d) / 12;
+}
+
+function deepClone(obj) {
+    return JSON.parse(JSON.stringify(obj ?? {}));
+}
+
+function pick() {
+    for (const v of arguments) {
+        if (v === 0 || v === false) return v;
+        if (v === undefined || v === null) continue;
+        if (typeof v === 'string') {
+            if (v.trim() !== '') return v;
+            continue;
+        }
+        return v;
+    }
+    return null;
+}
+
+function uniqRounded(nums) {
+    const seen = new Set();
+    const out = [];
+    for (const raw of nums) {
+        const v = Math.round(num(raw));
+        if (v >= 0 && !seen.has(v)) {
+            seen.add(v);
+            out.push(v);
+        }
+    }
+    return out;
+}
+
+function safeTranscript(root, output) {
+    const directTranscript =
+        root?.transcript?.output ||
+        root?.transcript ||
+        output?.transcript?.output ||
+        output?.transcript ||
+        root?.transcript_insights ||
+        output?.transcript_insights;
+
+    if (directTranscript && typeof directTranscript === 'object' && !Array.isArray(directTranscript)) {
+        return directTranscript;
+    }
+
+    const outputLooksLikeTranscript =
+        output &&
+        typeof output === 'object' &&
+        !Array.isArray(output) &&
+        (
+            output.sellerUrgency !== undefined ||
+            output.sellerHardship !== undefined ||
+            output.conditionOfProperty !== undefined ||
+            output.price !== undefined ||
+            output.additionalInsights !== undefined ||
+            output.nextSteps !== undefined ||
+            output['Suggested Follow up Script'] !== undefined
+        );
+
+    if (outputLooksLikeTranscript) {
+        return {
+            sellerUrgency: output.sellerUrgency ?? '',
+            sellerHardship: output.sellerHardship ?? '',
+            conditionOfProperty: output.conditionOfProperty ?? '',
+            price: output.price ?? '',
+            additionalInsights: output.additionalInsights ?? '',
+            nextSteps: output.nextSteps ?? '',
+            suggestedFollowUpScript:
+                output['Suggested Follow up Script'] ??
+                output.suggestedFollowUpScript ??
+                ''
+        };
+    }
+
+    return {};
+}
+
+function yearsToRecaptureCash(totalIn, annualCF) {
+    const t = num(totalIn);
+    const cf = num(annualCF);
+    if (t <= 0 || cf <= 0) return null;
+    return round(t / cf, 1);
+}
+
+function cashFlowProfile(monthlyCF) {
+    const cf = num(monthlyCF);
+    if (cf >= 200) return 'positive_cash_flow';
+    if (cf >= 0) return 'near_break_even';
+    return 'negative_leverage';
+}
+
+function computeEquityPct(metricsEquityPct, loanBalance, asIsValue, existingLtv) {
+    let equityPct = num(metricsEquityPct);
+    if (equityPct > 0 && equityPct <= 1) equityPct *= 100;
+
+    if (equityPct !== 0 && !equityPct) {
+        if (num(existingLtv) > 0 && num(existingLtv) <= 1) {
+            equityPct = (1 - num(existingLtv)) * 100;
+        } else if (loanBalance > 0 && asIsValue > 0) {
+            equityPct = ((asIsValue - loanBalance) / asIsValue) * 100;
+        } else if (loanBalance <= 0 && asIsValue > 0) {
+            equityPct = 100;
+        } else {
+            equityPct = 0;
+        }
+    }
+
+    return round(clamp(equityPct, -100, 100), 2);
+}
+
+function routeFamilies(loanBalance, equityPct) {
+    if (loanBalance <= 0) {
+        return { primary: 'seller_finance', secondary: [], confidence: 'high', reason: 'free_clear' };
+    }
+    if (equityPct < 20) {
+        return { primary: 'subto', secondary: ['hybrid'], confidence: equityPct < 10 ? 'high' : 'medium', reason: 'equity_below_20' };
+    }
+    if (equityPct <= 85) {
+        return { primary: 'hybrid', secondary: ['subto'], confidence: 'high', reason: 'equity_20_to_85' };
+    }
+    return { primary: 'seller_finance', secondary: ['hybrid'], confidence: 'high', reason: 'equity_above_85' };
+}
+
+function validateCanonicalInput(input) {
+    const errors = [];
+    const warnings = [];
+
+    if (!input.property.arv) warnings.push({ code: 'MISSING_ARV', message: 'ARV missing or zero.' });
+    if (!input.property.asIsValue) warnings.push({ code: 'MISSING_AS_IS_VALUE', message: 'As-is value missing or zero.' });
+    if (!input.income.rentMonthly && !input.income.annualRent) warnings.push({ code: 'MISSING_RENT', message: 'Rent missing or zero.' });
+    if (input.debt.balance > 0 && !input.debt.monthlyPI) warnings.push({ code: 'MISSING_LOAN_PI', message: 'Debt balance present but monthly PI missing or zero.' });
+
+    const basePriceAvailable = [
+        input.property.listPrice,
+        input.property.asIsValue,
+        input.property.arv,
+        input.debt.balance
+    ].some(v => Number(v) > 0);
+
+    if (!basePriceAvailable) {
+        errors.push({ code: 'NO_PRICE_BASIS', message: 'No valid price basis available.' });
+    }
+
+    if (input.padsplit?.feasible && input.padsplit?.grossRentMonthly <= 0 && input.padsplit?.targetRooms <= 0) {
+        warnings.push({ code: 'PADSPLIT_RENT_UNDERMODELED', message: 'Padsplit feasible but no usable padsplit rent model was found.' });
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+}
+
+function computeEconomics(input, policy) {
+    const annualRent = num(input.income.annualRent || num(input.income.rentMonthly) * 12);
+    const rentMonthly = num(input.income.rentMonthly || (annualRent > 0 ? annualRent / 12 : 0));
+
+    const taxes = num(input.expenses.taxesAnnual);
+    const insurance = num(input.expenses.insuranceAnnual);
+    const mgmt = num(input.expenses.mgmtAnnual || annualRent * policy.economics.mgmt_rate);
+    const maint = num(input.expenses.maintAnnual || annualRent * policy.economics.maint_rate);
+    const vacancy = num(input.expenses.vacancyAnnual || annualRent * policy.economics.vacancy_rate);
+    const utilities = num(input.expenses.utilitiesAnnual);
+    const opexAnnual = num(input.expenses.opexAnnual || taxes + insurance + mgmt + maint + vacancy + utilities);
+    const noi = num(input.expenses.noi || annualRent - opexAnnual);
+    const tiMonthly = round((taxes + insurance) / 12, 2);
+    const monthlyOpex = round(opexAnnual / 12, 2);
+
+    return {
+        annualRent,
+        rentMonthly,
+        taxes,
+        insurance,
+        mgmt,
+        maint,
+        vacancy,
+        utilities,
+        opexAnnual,
+        noi,
+        tiMonthly,
+        monthlyOpex
+    };
+}
+
+function computePadsplitGrossRentMonthly(input, policy) {
+    const p = input.padsplit || {};
+    const roomRateStandard = num(p.standardRoomRate || policy.mandates.padsplit.standard_room_rate_default);
+    const roomRateEnsuite = num(p.ensuiteRoomRate || policy.mandates.padsplit.ensuite_room_rate_default);
+    const standardRooms = num(p.standardRoomCount);
+    const ensuiteRooms = num(p.ensuiteRoomCount);
+
+    if (num(p.grossRentMonthly) > 0) return num(p.grossRentMonthly);
+    const roomMixGross = (standardRooms * roomRateStandard) + (ensuiteRooms * roomRateEnsuite);
+    if (roomMixGross > 0) return roomMixGross;
+
+    return 0;
+}
+
+function computePadsplitEconomics(input, policy) {
+    const annualTaxes = num(input.expenses.taxesAnnual);
+    const annualInsurance = num(input.expenses.insuranceAnnual);
+    const grossRentMonthly = computePadsplitGrossRentMonthly(input, policy);
+    const annualRent = round(grossRentMonthly * 12, 0);
+
+    const vacancy = round(annualRent * num(policy.mandates.padsplit.vacancy_rate), 0);
+    const mgmt = round(annualRent * num(policy.mandates.padsplit.mgmt_rate), 0);
+    const maint = round(annualRent * num(policy.mandates.padsplit.maint_rate), 0);
+    const utilities = round(num(input.padsplit.monthlyUtilities) * 12, 0);
+    const cleaning = round(num(input.padsplit.monthlyCleaning) * 12, 0);
+    const turnReserve = round(num(input.padsplit.monthlyTurnReserve) * 12, 0);
+
+    const opexAnnual = annualTaxes + annualInsurance + vacancy + mgmt + maint + utilities + cleaning + turnReserve;
+    const noi = round(annualRent - opexAnnual, 0);
+
+    return {
+        grossRentMonthly,
+        annualRent,
+        taxes: annualTaxes,
+        insurance: annualInsurance,
+        vacancy,
+        mgmt,
+        maint,
+        utilities,
+        cleaning,
+        turnReserve,
+        opexAnnual,
+        noi,
+        monthlyOpex: round(opexAnnual / 12, 2)
+    };
+}
+
+function buildDerivedMetrics({ noi, rentMonthly, monthlyOpex, monthlyPI, purchasePrice, totalIn }) {
+    const ADS = round(monthlyPI * 12, 0);
+    const DSCR = ADS > 0 ? round(noi / ADS, 2) : 0;
+    const annualCF = round(noi - ADS, 0);
+    const monthlyCF = round(annualCF / 12, 0);
+    const coc = totalIn > 0 ? round((annualCF / totalIn) * 100, 1) : 0;
+    const entryPct = purchasePrice > 0 ? round((totalIn / purchasePrice) * 100, 2) : 999;
+    const breakEvenRent = round(monthlyPI + monthlyOpex, 2);
+    const rentGap = round(breakEvenRent - rentMonthly, 2);
+    const rentGapPct = rentMonthly > 0 ? round((rentGap / rentMonthly) * 100, 1) : 0;
+    const paybackYears = yearsToRecaptureCash(totalIn, annualCF);
+
+    return {
+        ADS,
+        DSCR,
+        annualCF,
+        monthlyCF,
+        coc,
+        entryPct,
+        breakEvenRent,
+        rentGap,
+        rentGapPct,
+        paybackYears,
+        cashFlowProfile: cashFlowProfile(monthlyCF)
+    };
+}
+
+function canonicalRentalModel(root) {
+    return lower(
+        pick(
+            root?.canonical?.rental_model,
+            root?.canonical_rental_model,
+            root?.output?.canonical?.rental_model,
+            root?.output?.canonical_rental_model,
+            'standard'
+        )
+    );
+}
+
+function inferProfileName(root) {
+    const explicit = lower(pick(root.offer_profile, root.profile, root.output?.offer_profile, root.output?.profile, ''));
+    if (explicit) return explicit;
+
+    const model = canonicalRentalModel(root);
+    const padsplitFeasible = !!(
+        root?.rental_models?.padsplit?.feasible ||
+        root?.output?.rental_models?.padsplit?.feasible ||
+        root?.padsplit_current_vs_target?.feasible ||
+        root?.output?.padsplit_current_vs_target?.feasible
+    );
+
+    return model === 'padsplit' || padsplitFeasible ? 'padsplit' : 'balanced';
+}
+
+function selectedMandate(ctx) {
+    return ctx?.profile?.mandate || 'cashflow';
+}
+
+function selectedTargetDSCR(ctx) {
+    const mandate = selectedMandate(ctx);
+    if (mandate === 'padsplit') return num(ctx.policy?.mandates?.padsplit?.min_dscr_target || 1.80);
+    if (mandate === 'brrrr') return num(ctx.policy?.target_dscr || 1.28);
+    return num(ctx.policy?.target_dscr || 1.28);
+}
+
+function selectedSolveDSCR(ctx) {
+    const target = selectedTargetDSCR(ctx);
+    const baseBuffer = num(ctx.policy?.target_dscr_solve_buffer || target + 0.005);
+    return Math.max(baseBuffer, target + 0.005);
+}
+
+function selectedSolveEconomics(ctx) {
+    if (selectedMandate(ctx) === 'padsplit') {
+        return {
+            noi: num(ctx.padsplitEcon?.noi),
+            rentMonthly: num(ctx.padsplitEcon?.grossRentMonthly),
+            monthlyOpex: num(ctx.padsplitEcon?.monthlyOpex),
+            annualRent: num(ctx.padsplitEcon?.annualRent),
+            opexAnnual: num(ctx.padsplitEcon?.opexAnnual)
+        };
+    }
+
+    return {
+        noi: num(ctx.econ?.noi),
+        rentMonthly: num(ctx.econ?.rentMonthly),
+        monthlyOpex: num(ctx.econ?.monthlyOpex),
+        annualRent: num(ctx.econ?.annualRent),
+        opexAnnual: num(ctx.econ?.opexAnnual)
+    };
+}
+
+function mandateDSCR(candidate, profile) {
+    return (profile?.mandate || 'cashflow') === 'padsplit'
+        ? num(candidate?.padsplitDSCR)
+        : num(candidate?.DSCR);
+}
+
+function mandateMonthlyCF(candidate, profile) {
+    return (profile?.mandate || 'cashflow') === 'padsplit'
+        ? num(candidate?.padsplitMonthlyCF)
+        : num(candidate?.monthlyCF);
+}
+
+function mandateCoC(candidate, profile) {
+    return (profile?.mandate || 'cashflow') === 'padsplit'
+        ? num(candidate?.padsplitCoC)
+        : num(candidate?.coc);
+}
+
+function normalizeInput(root, policy) {
+    const output = (root.output && typeof root.output === 'object' && !Array.isArray(root.output)) ? root.output : {};
+    const property = deepClone(root.property || output.property || {});
+    const metrics = deepClone(root.metrics || output.metrics || {});
+    const existingLoan = deepClone(root.existing_loan || output.existing_loan || {});
+    const normalizedSubject = deepClone(root.normalized_subject || output.normalized_subject || root.resolved || output.resolved || {});
+    const transcript = safeTranscript(root, output);
+    const lead = root.webhook_custom_data || root.customData || root.body?.customData || root.body || {};
+    const canonical = root.canonical || output.canonical || {};
+    const canonicalStandard = canonical.economics_standard || canonical.economics || {};
+    const canonicalPadsplit = canonical.economics_padsplit || {};
+    const rentalModels = root.rental_models || output.rental_models || {};
+    const standardRental = rentalModels.standard || {};
+    const padsplitRental = rentalModels.padsplit || {};
+    const padsplitRentalEconomics = padsplitRental.economics || {};
+
+    const arv = num(pick(metrics.arv, root.estimated_arv, output.estimated_arv, property.arv_value, normalizedSubject.est_arv, normalizedSubject.source_assumptions?.est_arv, lead['opp.estArv'], lead.estArv));
+    const listPrice = num(pick(metrics.list_price, metrics.price, property.list_price, property.mls?.price_num, normalizedSubject.source_assumptions?.list_price, lead['opp.listPrice'], lead.list_price, lead.listPrice));
+    const asIsValue = num(pick(metrics.as_is_value, property.est_value, normalizedSubject.source_assumptions?.est_value, lead['opp.estValue'], lead.estValue, lead.est_value, lead['opp.assessedTotalValue']));
+
+    const rentMonthly = num(pick(
+        metrics.standardGrossRent,
+        canonicalStandard.grossRentMonthly,
+        standardRental.grossRentMonthly,
+        metrics.grossRent,
+        metrics.gross_rent_monthly,
+        root.standard_rent_monthly,
+        0
+    ));
+    const annualRent = num(pick(
+        canonicalStandard.annualRent,
+        standardRental.annualRent,
+        metrics.annualRent,
+        metrics.annual_rent,
+        rentMonthly > 0 ? rentMonthly * 12 : 0
+    ));
+
+    const taxesAnnual = num(pick(metrics.taxes, canonicalStandard.taxes, property.annual_taxes, normalizedSubject.annual_taxes, normalizedSubject.source_assumptions?.annual_taxes, lead['annual taxes'], lead['anual taxes'], 0));
+    const insuranceAnnual = num(pick(metrics.insurance, canonicalStandard.insurance, property.annual_insurance, lead.insuranceAnnual, 0));
+    const mgmtAnnual = num(pick(metrics.mgmt, standardRental.mgmt, annualRent > 0 ? Math.round(annualRent * policy.economics.mgmt_rate) : 0));
+    const maintAnnual = num(pick(metrics.maint, standardRental.maint, annualRent > 0 ? Math.round(annualRent * policy.economics.maint_rate) : 0));
+    const vacancyAnnual = num(pick(metrics.vacancy, standardRental.vacancy, annualRent > 0 ? Math.round(annualRent * policy.economics.vacancy_rate) : 0));
+    const utilitiesAnnual = num(pick(metrics.utilities, standardRental.utilities, 0));
+    const opexAnnual = num(pick(canonicalStandard.opexAnnual, standardRental.opex, metrics.opex, taxesAnnual + insuranceAnnual + mgmtAnnual + maintAnnual + vacancyAnnual + utilitiesAnnual));
+    const noi = num(pick(canonicalStandard.NOI, canonicalStandard.noi, standardRental.noi, metrics.noi, annualRent - opexAnnual));
+
+    const balance = num(pick(existingLoan.balance, normalizedSubject.loan_data?.loan_1_balance, lead['Loan 1 Balance'], lead['opp.totalAmountOfOpenLoans'], lead.totalAmountOfOpenLoans));
+    const ratePct = num(pick(existingLoan.rate, normalizedSubject.loan_data?.loan_1_rate, lead['Loan 1 rate'], lead['Loan 1 Rate']));
+    const monthlyPI = num(pick(existingLoan.sellerMonthlyPaymentPI, normalizedSubject.loan_data?.loan_1_monthly_payment, lead['Loan 1 Monthly payment'], lead['Uw Loan 1 Monthly Payment'], (balance > 0 && ratePct > 0) ? pmt(ratePct, 30, balance) : 0));
+
+    return {
+        raw: root,
+        property_raw: property,
+        metrics_raw: metrics,
+        existing_loan_raw: existingLoan,
+        normalized_subject: normalizedSubject,
+        transcript,
+        lead,
+        property: {
+            arv,
+            listPrice,
+            asIsValue,
+            dom: num(pick(property.dom, metrics.dom, lead['Days on Market'], lead.daysOnMarket, 0)),
+            mlsStatus: lower(pick(normalizedSubject.mls_list_status, normalizedSubject.source_assumptions?.mls_list_status, lead['opp.mlsListStatus'], lead['MLS List Status'], property.mls?.status, property.list_status, ''))
+        },
+        income: {
+            rentMonthly,
+            annualRent
+        },
+        expenses: {
+            taxesAnnual,
+            insuranceAnnual,
+            mgmtAnnual,
+            maintAnnual,
+            vacancyAnnual,
+            utilitiesAnnual,
+            opexAnnual,
+            noi
+        },
+        debt: {
+            balance,
+            ratePct,
+            monthlyPI,
+            originalPrincipal: num(pick(existingLoan.original_principal, normalizedSubject.loan_data?.loan_1_original_principal, lead['loan 1 original principal'], lead['Loan 1 Original Principal'], 0)),
+            ltv: num(existingLoan.ltv)
+        },
+        padsplit: {
+            allowed: !!root.rental_models?.padsplit?.allowed,
+            feasible: !!root.rental_models?.padsplit?.feasible,
+            grossRentMonthly: num(pick(canonicalPadsplit.grossRentMonthly, padsplitRentalEconomics.grossRentMonthly, padsplitRental.grossRentMonthly, metrics.padsplitGrossRent)),
+            currentRooms: num(root.rental_models?.padsplit?.debug?.currentRooms ?? root.padsplit_current_vs_target?.currentRooms),
+            targetRooms: num(root.rental_models?.padsplit?.debug?.targetRooms ?? root.padsplit_current_vs_target?.targetRooms),
+            ensuiteRoomCount: num(root.padsplit_room_mix?.ensuiteRoomCount ?? root.body?.padsplit_room_mix?.ensuiteRoomCount ?? 0),
+            standardRoomCount: num(root.padsplit_room_mix?.standardRoomCount ?? root.body?.padsplit_room_mix?.standardRoomCount ?? 0),
+            standardRoomRate: num(root.padsplit_room_mix?.standardRoomRate ?? root.body?.padsplit_room_mix?.standardRoomRate ?? root.rental_models?.padsplit?.debug?.standardRoomRate ?? policy.mandates.padsplit.standard_room_rate_default),
+            ensuiteRoomRate: num(root.padsplit_room_mix?.ensuiteRoomRate ?? root.body?.padsplit_room_mix?.ensuiteRoomRate ?? root.rental_models?.padsplit?.debug?.ensuiteRoomRate ?? policy.mandates.padsplit.ensuite_room_rate_default),
+            upliftMonthly: num(pick(root.rental_models?.padsplit?.debug?.upliftMonthly, root.padsplit_current_vs_target?.upliftMonthly, metrics.padsplitUpliftMonthly)),
+            renoEstimate: num(root.rental_models?.padsplit?.debug?.totalRenoEstimate ?? root.padsplit_current_vs_target?.totalRenoEstimate ?? root.rental_models?.padsplit?.debug?.renoEstimate ?? 0),
+            supportedReno: num(root.rental_models?.padsplit?.debug?.supportedReno ?? root.padsplit_current_vs_target?.supportedReno ?? 0),
+            monthlyUtilities: num(root.padsplit_expenses?.monthlyUtilities ?? root.body?.padsplit_expenses?.monthlyUtilities ?? padsplitRentalEconomics.monthlyUtilities ?? policy.mandates.padsplit.default_monthly_utilities),
+            monthlyCleaning: num(root.padsplit_expenses?.monthlyCleaning ?? root.body?.padsplit_expenses?.monthlyCleaning ?? policy.mandates.padsplit.default_monthly_cleaning),
+            monthlyTurnReserve: num(root.padsplit_expenses?.monthlyTurnReserve ?? root.body?.padsplit_expenses?.monthlyTurnReserve ?? policy.mandates.padsplit.default_monthly_turn_reserve),
+            bathroomRisk: root.rental_models?.padsplit?.debug?.bathroomInfrastructureRisk ?? root.padsplit_current_vs_target?.bathroomInfrastructureRisk ?? null,
+            upstream: deepClone(root.rental_models?.padsplit || root.padsplit || {})
+        },
+        marketSignals: {
+            motivationHigh: num(pick(property.dom, metrics.dom, lead['Days on Market'], lead.daysOnMarket, 0)) >= 90,
+            competitionHigh: false,
+            isShortSale: /short sale/.test(lower(pick(normalizedSubject.mls_list_status, property.mls?.status, property.list_status, '')))
+        }
+    };
+}
+
+function computeMotivationBracket(signals) {
+    if (signals.competitionHigh) return 'aggressive';
+    if (signals.motivationHigh) return 'conservative';
+    return 'neutral';
+}
+
+function computeCTS(input, policy) {
+    const askingPrice = input.property.listPrice || input.property.asIsValue || input.property.arv || 0;
+    const agentCommission = Math.round(askingPrice * policy.economics.agent_commission_rate);
+    const sellerClosingCosts = Math.round(askingPrice * policy.economics.seller_closing_cost_rate);
+    const sellerRetailNet = Math.round(askingPrice - input.debt.balance - agentCommission - sellerClosingCosts);
+
+    let ctsConservative = 0;
+    let ctsStandard = 0;
+    let ctsAggressive = 0;
+
+    if (sellerRetailNet < -20000) {
+        ctsConservative = 0;
+        ctsStandard = 0;
+        ctsAggressive = 0;
+    } else if (sellerRetailNet <= 0) {
+        ctsConservative = 0;
+        ctsStandard = 1500;
+        ctsAggressive = 4000;
+    } else if (sellerRetailNet <= 5000) {
+        ctsConservative = 1500;
+        ctsStandard = 2000;
+        ctsAggressive = Math.min(7000, sellerRetailNet);
+    } else {
+        ctsConservative = Math.round(Math.min(sellerRetailNet * 0.10, sellerRetailNet));
+        ctsStandard = Math.round(Math.min(sellerRetailNet * 0.20, sellerRetailNet));
+        ctsAggressive = Math.round(Math.min(sellerRetailNet * 0.30, sellerRetailNet));
+    }
+
+    const hardCap15pct = Math.round(askingPrice * policy.economics.cts_hard_cap_pct);
+    const motivationBracket = computeMotivationBracket(input.marketSignals);
+
+    let recommendedCTS = ctsStandard;
+    if (motivationBracket === 'aggressive') recommendedCTS = ctsAggressive;
+    if (motivationBracket === 'conservative') recommendedCTS = ctsConservative;
+    recommendedCTS = Math.max(0, Math.min(recommendedCTS, hardCap15pct));
+
+    return {
+        seller_retail_net: sellerRetailNet,
+        agent_commission: agentCommission,
+        seller_closing_costs: sellerClosingCosts,
+        cts_conservative: ctsConservative,
+        cts_standard: ctsStandard,
+        cts_aggressive: ctsAggressive,
+        recommended_cts: recommendedCTS,
+        motivation_bracket: motivationBracket === 'aggressive' ? 'competition_high' : motivationBracket,
+        hard_cap_15pct: hardCap15pct
+    };
+}
+
+function cashOfferPctByArv(arv) {
+    const a = num(arv);
+    if (a < 150000) return 0.53;
+    if (a < 200000) return 0.56;
+    if (a < 300000) return 0.66;
+    if (a < 400000) return 0.71;
+    if (a < 500000) return 0.72;
+    return 0.73;
+}
+
+function cashOfferPctLabel(arv) {
+    const a = num(arv);
+    if (a < 150000) return '< $150k → 53%';
+    if (a < 200000) return '$150–200k → 56%';
+    if (a < 300000) return '$200–300k → 66%';
+    if (a < 400000) return '$300–400k → 71%';
+    if (a < 500000) return '$400–500k → 72%';
+    return '$500k+ → 73%';
+}
+
+function transcriptHasSpecificRepairSignal(input) {
+    const blob = [
+        input.transcript?.conditionOfProperty,
+        input.transcript?.additionalInsights,
+        input.transcript?.price,
+        input.lead?.prequalified_phone_transcript,
+        input.lead?.contact_pq_transcript,
+        input.property_raw?.mls_description,
+        input.raw?.mls_description
+    ].map(txt).join(' ').toLowerCase();
+
+    if (!blob || /no transcript provided/.test(blob)) return false;
+
+    return /\b(roof|hvac|a\/c|ac unit|air conditioner|plumbing|electrical|foundation|mold|water damage|fire damage|termite|sewer|septic|windows|flooring|kitchen|bathroom|paint|drywall|needs work|repair|repairs|renovation|rehab|deferred maintenance)\b/i.test(blob);
+}
+
+function computeCashOffer(input, policy) {
+    const arv = num(input.property.arv);
+    const repairEstimate = num(pick(input.metrics_raw.estimatedRepairCost, input.metrics_raw.repair_estimate, input.raw.repair_estimate, 0));
+    const pctUsed = cashOfferPctByArv(arv);
+    const pctLabel = cashOfferPctLabel(arv);
+    const baseCashOffer = Math.round(arv * pctUsed);
+
+    const hasSpecificRepairSignal = transcriptHasSpecificRepairSignal(input);
+    const repairDeductionUsed = 0;
+    const mao = Math.max(0, Math.round(baseCashOffer));
+
+    const buyerAcquisitionCostsReference = Math.round(arv * num(policy.economics.buyer_acquisition_cost_rate ?? 0.05));
+    const sellerAgentFeeReference = Math.round(num(input.property.listPrice || input.property.asIsValue || arv) * num(policy.economics.agent_commission_rate ?? 0.03));
+    const sellerClosingCostsReference = Math.round(num(input.property.listPrice || input.property.asIsValue || arv) * num(policy.economics.seller_closing_cost_rate ?? 0.015));
+
+    const lowRehab = Math.round(arv * 0.03);
+    const mediumRehab = Math.round(arv * 0.07);
+    const fullRehab = Math.round(arv * 0.12);
+
+    const wholesaleFee = num(pick(policy.economics.wholesale_assignment_fee, input.metrics_raw.wholesaleFee, input.raw.wholesale_fee, 15000));
+    const cashPctOfArv = arv > 0 ? round((mao / arv) * 100, 1) : 0;
+    const spreadVsList = input.property.listPrice > 0 ? Math.round(mao - input.property.listPrice) : 0;
+
+    return {
+        buyerClosingCosts: buyerAcquisitionCostsReference,
+        buyerAcquisitionCostsReference,
+        sellerAgentFeeReference,
+        sellerClosingCostsReference,
+        wholesaleFee,
+        repairEstimate,
+        repairDeductionUsed,
+        hasSpecificRepairSignal,
+        lowRehab,
+        mediumRehab,
+        fullRehab,
+        mao,
+        cashPctOfArv,
+        spreadVsList,
+        cash_offer: {
+            type: 'Cash',
+            arv,
+            cash_offer_table: pctLabel,
+            cash_offer_pct_used: `${round(pctUsed * 100, 0)}%`,
+            buy_box_pct: `${round(pctUsed * 100, 0)}%`,
+            base_cash_offer_before_repair_deduction: baseCashOffer,
+            repair_estimate: repairEstimate,
+            repair_deduction_used: repairDeductionUsed,
+            repair_deduction_reason: hasSpecificRepairSignal
+                ? 'Specific repair signal found in transcript/listing context.'
+                : 'No specific repair signal found; repairs shown for reference only and not deducted from MAO.',
+            low_rehab_reference: lowRehab,
+            medium_rehab_reference: mediumRehab,
+            full_rehab_reference: fullRehab,
+            buyer_acquisition_costs_reference: buyerAcquisitionCostsReference,
+            seller_agent_fee_reference: sellerAgentFeeReference,
+            seller_closing_costs_reference: sellerClosingCostsReference,
+            buyer_closing_costs_included_in_mao: false,
+            wholesale_fee_included_in_mao: false,
+            cash_offer: mao,
+            cash_offer_pct_of_arv: `${cashPctOfArv}%`,
+            spread_vs_list_price: spreadVsList,
+            deal_viable: mao > 0
+        }
+    };
+}
+
+function withReasons(candidate, hardFails, softFails, forcedFallback = false) {
+    return {
+        ...candidate,
+        hard_fail_reasons: [...new Set(hardFails || [])],
+        soft_fail_reasons: [...new Set(softFails || [])],
+        forcedFallback,
+        pass: [...new Set(hardFails || [])].length === 0 && [...new Set(softFails || [])].length === 0
+    };
+}
+
+function computeFundedAmount(candidate) {
+    return round(
+        num(candidate.existingLoanBalance) +
+        num(candidate.sellerCarryPrincipal) +
+        num(candidate.cts) +
+        num(candidate.downPayment),
+        0
+    );
+}
+
+function enforceStructureIntegrity(candidate, policy) {
+    const hardFails = [...(candidate.hard_fail_reasons || [])];
+    const softFails = [...(candidate.soft_fail_reasons || [])];
+
+    const purchasePrice = num(candidate.purchasePrice);
+    const fundedAmount = computeFundedAmount(candidate);
+    const purchaseGap = round(purchasePrice - fundedAmount, 0);
+    const overfund = round(fundedAmount - purchasePrice, 0);
+
+    if (candidate.family === 'hybrid' && num(candidate.sellerCarryPrincipal) <= 0) hardFails.push('HYBRID_REQUIRES_SELLER_CARRY');
+    if (candidate.family === 'subto' && num(candidate.sellerCarryPrincipal) > 0) hardFails.push('SUBTO_CANNOT_INCLUDE_SELLER_CARRY');
+    if (candidate.family === 'seller_finance' && num(candidate.existingLoanBalance) > 0) hardFails.push('SELLER_FINANCE_REQUIRES_EXISTING_DEBT_RETIRED');
+    if (purchaseGap > num(policy.structure.purchase_gap_tolerance || 2500)) hardFails.push('UNFUNDED_PURCHASE_GAP');
+    if (overfund > num(policy.structure.overfund_tolerance || 2500)) hardFails.push('OVERFUNDED_PURCHASE_STACK');
+
+    return {
+        ...candidate,
+        fundedAmount,
+        purchaseGap,
+        hard_fail_reasons: [...new Set(hardFails)],
+        soft_fail_reasons: [...new Set(softFails)],
+        pass: [...new Set(hardFails)].length === 0 && [...new Set(softFails)].length === 0
+    };
+}
+
+function buildSellerFinanceCandidates(ctx) {
+    const { input, policy, cash } = ctx;
+    const solveEcon = selectedSolveEconomics(ctx);
+    const out = [];
+    const targetDSCR = selectedTargetDSCR(ctx);
+    const solveDSCR = selectedSolveDSCR(ctx);
+
+    const priceBase = input.property.listPrice || input.property.asIsValue || input.property.arv || 0;
+    if (priceBase <= 0) return out;
+
+    const priceTrials = uniqRounded([
+        priceBase,
+        priceBase * 0.97,
+        priceBase * 0.94,
+        priceBase * 0.90,
+        input.property.asIsValue,
+        input.property.arv * 0.80,
+        input.property.arv * 0.75
+    ]);
+
+    for (const requestedPrice of priceTrials) {
+        for (const downPct of policy.families.seller_finance.allowed_down_pcts) {
+            for (const ratePct of policy.families.seller_finance.allowed_rates) {
+                for (const balloonYrs of policy.families.seller_finance.allowed_balloons) {
+                    const amortYears = policy.families.seller_finance.amort_years;
+                    const maxMonthlyPI = maxMonthlyPIForTargetDSCR(solveEcon.noi, solveDSCR);
+                    const maxFinanced = pvFromPayment(ratePct, amortYears, maxMonthlyPI);
+                    const dscrAdjustedPrice = Math.floor(maxFinanced / (1 - downPct / 100));
+                    const price = Math.min(requestedPrice, dscrAdjustedPrice);
+
+                    if (price <= 0) continue;
+
+                    const downPayment = Math.round(price * downPct / 100);
+                    if (input.debt.balance > 0 && downPayment < input.debt.balance) continue;
+
+                    const financed = Math.max(price - downPayment, 0);
+                    const monthlyPI = Math.round(pmt(ratePct, amortYears, financed));
+                    const assignment = Math.round(downPayment * policy.economics.assignment_pct_of_entry);
+                    const totalIn = Math.round(downPayment + cash.buyerClosingCosts + assignment);
+
+                    const derived = buildDerivedMetrics({
+                        noi: solveEcon.noi,
+                        rentMonthly: solveEcon.rentMonthly,
+                        monthlyOpex: solveEcon.monthlyOpex,
+                        monthlyPI,
+                        purchasePrice: price,
+                        totalIn
+                    });
+
+                    const hardFails = [];
+                    const softFails = [];
+
+                    if (derived.DSCR < targetDSCR) hardFails.push('DSCR_BELOW_1_28_TARGET');
+                    if (derived.monthlyCF < policy.families.seller_finance.min_monthly_cf_hard) hardFails.push('MONTHLY_CF_HARD_FAIL');
+                    if (downPct > policy.families.seller_finance.max_down_pct) hardFails.push('DOWN_PAYMENT_TOO_HIGH');
+                    if (derived.monthlyCF < policy.families.seller_finance.min_monthly_cf_target) softFails.push('MONTHLY_CF_BELOW_TARGET');
+
+                    if (derived.coc < policy.families.seller_finance.min_coc_target) {
+                        if (derived.DSCR >= targetDSCR && derived.monthlyCF >= policy.families.seller_finance.min_monthly_cf_target) {
+                            softFails.push('COC_BELOW_TARGET_BUT_DSCR_PASS');
+                        } else {
+                            softFails.push('COC_BELOW_TARGET');
+                        }
+                    }
+
+                    out.push(withReasons({
+                        id: `seller_finance|${price}|${downPct}|${ratePct}|${balloonYrs}`,
+                        family: 'seller_finance',
+                        strategy: downPct <= 5 ? 'seller_finance_low_down' : 'seller_finance_standard',
+                        type: 'Seller Finance',
+                        requestedPrice,
+                        purchasePrice: price,
+                        targetDSCR,
+                        solveDSCR,
+                        dscrAdjustedPrice,
+                        priceAdjustedForDSCR: price < requestedPrice,
+                        downPayment,
+                        downPaymentPct: downPct,
+                        cts: null,
+                        ctsPct: null,
+                        existingLoanBalance: 0,
+                        existingLoanRate: null,
+                        existingLoanMonthlyPI: 0,
+                        sellerCarryPrincipal: financed,
+                        sellerCarryRate: ratePct,
+                        sellerCarryAmortYears: amortYears,
+                        sellerCarryBalloonYears: balloonYrs,
+                        sellerCarryMonthlyPI: monthlyPI,
+                        combinedMonthlyPI: monthlyPI,
+                        cashToSeller: downPayment,
+                        totalIn,
+                        financed,
+                        fundedAmount: round(downPayment + financed, 0),
+                        purchaseGap: round(price - (downPayment + financed), 0),
+                        ...derived
+                    }, hardFails, softFails));
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+function buildSubToCandidates(ctx) {
+    const { input, policy, cash, cts } = ctx;
+    const solveEcon = selectedSolveEconomics(ctx);
+    const out = [];
+    const targetDSCR = selectedTargetDSCR(ctx);
+
+    if (input.debt.balance <= 0 || input.debt.monthlyPI <= 0) return out;
+
+    const existingDSCR = input.debt.monthlyPI > 0 ? round(solveEcon.noi / (input.debt.monthlyPI * 12), 2) : 0;
+    if (existingDSCR < targetDSCR) return out;
+
+    const price = Math.max(input.property.listPrice || 0, input.debt.balance || 0, input.property.asIsValue || 0);
+    if (price <= 0) return out;
+
+    for (const coverSellerClosing of [false, true]) {
+        const sellerCloseCovered = coverSellerClosing ? cts.seller_closing_costs : 0;
+        const buyerSide = cash.buyerClosingCosts + sellerCloseCovered;
+
+        for (const ctsTrial of uniqRounded([cts.recommended_cts, cts.recommended_cts * 0.75, cts.recommended_cts * 0.5, 0])) {
+            const assignment = Math.round(ctsTrial * policy.economics.assignment_pct_of_entry);
+            const totalIn = Math.round(ctsTrial + buyerSide + assignment);
+            const unresolvedEquity = Math.max(price - input.debt.balance - ctsTrial, 0);
+
+            const derived = buildDerivedMetrics({
+                noi: solveEcon.noi,
+                rentMonthly: solveEcon.rentMonthly,
+                monthlyOpex: solveEcon.monthlyOpex,
+                monthlyPI: input.debt.monthlyPI,
+                purchasePrice: price,
+                totalIn
+            });
+
+            const hardFails = [];
+            const softFails = [];
+            const maxRate = input.debt.balance > policy.families.subto.large_balance_cutoff
+                ? policy.families.subto.max_rate_pct_large_balance
+                : policy.families.subto.max_rate_pct_small_balance;
+
+            if (derived.DSCR < targetDSCR) hardFails.push('DSCR_BELOW_1_27_TARGET');
+            if (unresolvedEquity > policy.families.subto.max_unresolved_equity) hardFails.push('UNRESOLVED_EQUITY_TOO_HIGH');
+            if (input.debt.ratePct > maxRate) hardFails.push('RATE_TOO_HIGH');
+            if (derived.entryPct > policy.families.subto.max_entry_pct) hardFails.push('ENTRY_TOO_HIGH');
+            if (derived.monthlyCF < policy.families.subto.min_monthly_cf_target) softFails.push('MONTHLY_CF_BELOW_TARGET');
+
+            out.push(withReasons({
+                id: `subto|${price}|${ctsTrial}|${coverSellerClosing ? 1 : 0}`,
+                family: 'subto',
+                strategy: ctsTrial === 0 ? 'subto_zero_entry' : 'subto_low_cts',
+                type: 'Subject-To',
+                requestedPrice: price,
+                purchasePrice: price,
+                targetDSCR,
+                dscrAdjustedPrice: price,
+                priceAdjustedForDSCR: false,
+                downPayment: null,
+                downPaymentPct: null,
+                cts: ctsTrial,
+                ctsPct: price > 0 ? round((ctsTrial / price) * 100, 2) : 0,
+                existingLoanBalance: input.debt.balance,
+                existingLoanRate: input.debt.ratePct || null,
+                existingLoanMonthlyPI: input.debt.monthlyPI,
+                sellerCarryPrincipal: 0,
+                sellerCarryRate: null,
+                sellerCarryAmortYears: null,
+                sellerCarryBalloonYears: null,
+                sellerCarryMonthlyPI: 0,
+                combinedMonthlyPI: input.debt.monthlyPI,
+                cashToSeller: ctsTrial,
+                totalIn,
+                unresolvedEquity,
+                fundedAmount: round(input.debt.balance + ctsTrial, 0),
+                purchaseGap: round(price - (input.debt.balance + ctsTrial), 0),
+                ...derived
+            }, hardFails, softFails));
+        }
+    }
+
+    return out;
+}
+
+function buildHybridCandidates(ctx) {
+    const { input, policy, cash, cts } = ctx;
+    const solveEcon = selectedSolveEconomics(ctx);
+    const out = [];
+    const targetDSCR = selectedTargetDSCR(ctx);
+    const solveDSCR = selectedSolveDSCR(ctx);
+
+    if (input.debt.balance <= 0 || input.debt.monthlyPI <= 0) return out;
+
+    const priceBase = Math.max(input.property.listPrice || 0, input.debt.balance || 0, input.property.asIsValue || 0);
+    if (priceBase <= 0) return out;
+
+    const priceTrials = uniqRounded([priceBase, priceBase * 0.97, priceBase * 0.94, priceBase * 0.90, input.property.asIsValue]);
+
+    for (const requestedPrice of priceTrials) {
+        for (const ctsTrial of uniqRounded([cts.recommended_cts, cts.recommended_cts * 0.75, cts.recommended_cts * 0.5, 0])) {
+            for (const carryRate of policy.families.hybrid.allowed_rates) {
+                for (const balloonYrs of policy.families.hybrid.allowed_balloons) {
+                    const carryYears = policy.families.hybrid.amort_years;
+                    const maxTotalMonthlyPI = maxMonthlyPIForTargetDSCR(solveEcon.noi, solveDSCR);
+                    const maxSellerCarryPI = Math.max(maxTotalMonthlyPI - input.debt.monthlyPI, 0);
+                    if (maxSellerCarryPI <= 0) continue;
+
+                    const maxSellerCarryPrincipal = pvFromPayment(carryRate, carryYears, maxSellerCarryPI);
+                    const maxCtsAtRequestedPrice = Math.round(requestedPrice * policy.families.hybrid.max_cts_pct / 100);
+                    const requestedCts = Math.min(ctsTrial, maxCtsAtRequestedPrice);
+
+                    const dscrAdjustedPrice = Math.floor(input.debt.balance + requestedCts + maxSellerCarryPrincipal);
+                    const price = Math.min(requestedPrice, dscrAdjustedPrice);
+                    if (price <= input.debt.balance) continue;
+
+                    const ctsValue = Math.min(requestedCts, Math.round(price * policy.families.hybrid.max_cts_pct / 100));
+                    const carryPrincipal = Math.max(price - input.debt.balance - ctsValue, 0);
+                    if (carryPrincipal <= 0) continue;
+
+                    const carryPI = Math.round(pmt(carryRate, carryYears, carryPrincipal));
+                    const combinedMonthlyPI = input.debt.monthlyPI + carryPI;
+                    const assignment = Math.round(ctsValue * policy.economics.assignment_pct_of_entry);
+                    const totalIn = Math.round(ctsValue + cash.buyerClosingCosts + assignment);
+                    const fundedAmount = round(input.debt.balance + carryPrincipal + ctsValue, 0);
+                    const purchaseGap = round(price - fundedAmount, 0);
+
+                    if (purchaseGap > num(policy.structure.purchase_gap_tolerance || 2500)) continue;
+
+                    const derived = buildDerivedMetrics({
+                        noi: solveEcon.noi,
+                        rentMonthly: solveEcon.rentMonthly,
+                        monthlyOpex: solveEcon.monthlyOpex,
+                        monthlyPI: combinedMonthlyPI,
+                        purchasePrice: price,
+                        totalIn
+                    });
+
+                    const hardFails = [];
+                    const softFails = [];
+
+                    if (derived.DSCR < targetDSCR) hardFails.push('DSCR_BELOW_1_27_TARGET');
+                    if (carryPrincipal <= 0) hardFails.push('NO_TRUE_SELLER_CARRY');
+                    if (derived.monthlyCF < policy.families.hybrid.min_monthly_cf_hard) hardFails.push('MONTHLY_CF_HARD_FAIL');
+                    if (derived.monthlyCF < policy.families.hybrid.min_monthly_cf_target) softFails.push('MONTHLY_CF_BELOW_TARGET');
+
+                    if (derived.coc < policy.families.hybrid.min_coc_target) {
+                        if (derived.DSCR >= targetDSCR && derived.monthlyCF >= policy.families.hybrid.min_monthly_cf_target) {
+                            softFails.push('COC_BELOW_TARGET_BUT_DSCR_PASS');
+                        } else {
+                            softFails.push('COC_BELOW_TARGET');
+                        }
+                    }
+
+                    out.push(withReasons({
+                        id: `hybrid|${price}|${ctsValue}|${carryRate}|${balloonYrs}`,
+                        family: 'hybrid',
+                        strategy: ctsValue === 0 ? 'hybrid_zero_cts' : 'hybrid_low_cts',
+                        type: 'Hybrid',
+                        requestedPrice,
+                        purchasePrice: price,
+                        targetDSCR,
+                        solveDSCR,
+                        dscrAdjustedPrice,
+                        priceAdjustedForDSCR: price < requestedPrice,
+                        downPayment: null,
+                        downPaymentPct: null,
+                        cts: ctsValue,
+                        ctsPct: price > 0 ? round((ctsValue / price) * 100, 2) : 0,
+                        existingLoanBalance: input.debt.balance,
+                        existingLoanRate: input.debt.ratePct || null,
+                        existingLoanMonthlyPI: input.debt.monthlyPI,
+                        sellerCarryPrincipal: carryPrincipal,
+                        sellerCarryRate: carryRate,
+                        sellerCarryAmortYears: carryYears,
+                        sellerCarryBalloonYears: balloonYrs,
+                        sellerCarryMonthlyPI: carryPI,
+                        combinedMonthlyPI,
+                        cashToSeller: ctsValue,
+                        totalIn,
+                        fundedAmount,
+                        purchaseGap,
+                        ...derived
+                    }, hardFails, softFails));
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+function buildForcedFallbackCandidates(ctx) {
+    const { input, econ, policy, cash } = ctx;
+    const solveEcon = selectedSolveEconomics(ctx);
+    if (!policy.fallback.enabled) return [];
+
+    const forced = [];
+    const targetDSCR = selectedTargetDSCR(ctx);
+
+    const basePrice = Math.max(
+        input.property.listPrice || 0,
+        input.debt.balance || 0,
+        input.property.asIsValue || 0,
+        input.property.arv || 0
+    );
+
+    if (basePrice <= 0) return forced;
+
+    const maxMonthlyPI = maxMonthlyPIForTargetDSCR(solveEcon.noi, targetDSCR);
+    const maxAnnualDebtService = round(maxMonthlyPI * 12, 0);
+
+    const diagnosticRate = 4.0;
+    const diagnosticAmortYears = 30;
+    const diagnosticDownPct = 10;
+
+    const maxFinancedAtDSCR = Math.floor(
+        pvFromPayment(diagnosticRate, diagnosticAmortYears, maxMonthlyPI)
+    );
+
+    const maxPurchasePriceAtDSCR = Math.floor(
+        maxFinancedAtDSCR / (1 - diagnosticDownPct / 100)
+    );
+
+    const downPayment = Math.round(basePrice * diagnosticDownPct / 100);
+    const financed = Math.max(basePrice - downPayment, 0);
+    const monthlyPI = Math.round(pmt(diagnosticRate, diagnosticAmortYears, financed));
+
+    const requiredNOIForTargetDSCR = round(monthlyPI * 12 * targetDSCR, 0);
+    const additionalNOINeeded = Math.max(requiredNOIForTargetDSCR - solveEcon.noi, 0);
+
+    const expenseLoadMonthly = econ.monthlyOpex;
+    const rentNeededForTargetDSCR = round(
+        (requiredNOIForTargetDSCR + solveEcon.opexAnnual) / 12,
+        2
+    );
+
+    const rentGapToTargetDSCR = round(
+        rentNeededForTargetDSCR - solveEcon.rentMonthly,
+        2
+    );
+
+    const derived = buildDerivedMetrics({
+        noi: solveEcon.noi,
+        rentMonthly: solveEcon.rentMonthly,
+        monthlyOpex: solveEcon.monthlyOpex,
+        monthlyPI,
+        purchasePrice: basePrice,
+        totalIn: downPayment + cash.buyerClosingCosts
+    });
+
+    forced.push(withReasons({
+        id: `diagnostic_dscr_gap|${basePrice}|${downPayment}`,
+        family: 'diagnostic',
+        strategy: 'diagnostic_dscr_gap',
+        type: 'No Viable Creative Offer - DSCR Diagnostic',
+        requestedPrice: basePrice,
+        purchasePrice: basePrice,
+
+        targetDSCR,
+        solveDSCR: targetDSCR,
+
+        dscrAdjustedPrice: maxPurchasePriceAtDSCR,
+        priceAdjustedForDSCR: maxPurchasePriceAtDSCR < basePrice,
+
+        maxPurchasePriceAtTargetDSCR: maxPurchasePriceAtDSCR,
+        maxFinancedAtTargetDSCR: maxFinancedAtDSCR,
+        maxMonthlyPIAtTargetDSCR: round(maxMonthlyPI, 2),
+        maxAnnualDebtServiceAtTargetDSCR: maxAnnualDebtService,
+
+        requiredNOIForTargetDSCR,
+        currentNOI: solveEcon.noi,
+        additionalNOINeeded,
+
+        currentRent: solveEcon.rentMonthly,
+        rentNeededForTargetDSCR,
+        rentGapToTargetDSCR,
+
+        diagnosticRate,
+        diagnosticAmortYears,
+        diagnosticDownPct,
+
+        downPayment,
+        downPaymentPct: diagnosticDownPct,
+        cts: null,
+        ctsPct: null,
+        existingLoanBalance: 0,
+        existingLoanRate: null,
+        existingLoanMonthlyPI: 0,
+        sellerCarryPrincipal: financed,
+        sellerCarryRate: diagnosticRate,
+        sellerCarryAmortYears: diagnosticAmortYears,
+        sellerCarryBalloonYears: null,
+        sellerCarryMonthlyPI: monthlyPI,
+        combinedMonthlyPI: monthlyPI,
+        cashToSeller: downPayment,
+        totalIn: downPayment + cash.buyerClosingCosts,
+        financed,
+        fundedAmount: round(downPayment + financed, 0),
+        purchaseGap: 0,
+
+        ...derived
+    }, [
+        'FALLBACK_ONLY',
+        'DSCR_BELOW_1_28_TARGET',
+        'NOT_SELLER_FACING',
+        'DIAGNOSTIC_ONLY'
+    ], [], true));
+
+    return forced;
+}
+
+function attachMandateMetrics(candidate, ctx) {
+    const purchasePrice = num(candidate.purchasePrice);
+    const repairEstimateForReference = num(ctx.cash.repairEstimate || 0);
+    const asIsValue = num(ctx.input.property.asIsValue || 0);
+    const arv = num(ctx.input.property.arv || 0);
+
+    const instantEquity = Math.max(asIsValue - purchasePrice, 0);
+    const instantEquityPct = purchasePrice > 0 ? round((instantEquity / purchasePrice) * 100, 2) : 0;
+
+    const arvSpread = Math.max(arv - purchasePrice, 0);
+    const arvSpreadPct = purchasePrice > 0 ? round((arvSpread / purchasePrice) * 100, 2) : 0;
+
+    const allInBasis = round(
+        purchasePrice + repairEstimateForReference + num(candidate.totalIn || 0) + num(ctx.input.padsplit?.renoEstimate || 0),
+        0
+    );
+    const allInToArvPct = arv > 0 ? round(allInBasis / arv, 4) : 999;
+
+    const standardRent = num(pick(ctx.input?.metrics_raw?.standardGrossRent, ctx.input?.raw?.rental_models?.standard?.grossRentMonthly, ctx.econ.rentMonthly, 0));
+    const padsplitRent = num(pick(ctx.input?.metrics_raw?.padsplitGrossRent, ctx.input?.raw?.rental_models?.padsplit?.grossRentMonthly, ctx.padsplitEcon?.grossRentMonthly, 0));
+    const padsplitUpside = Math.max(padsplitRent - standardRent, 0);
+    const padsplitUpsidePct = standardRent > 0 ? round((padsplitUpside / standardRent) * 100, 2) : 0;
+
+    return {
+        ...candidate,
+        instantEquity,
+        instantEquityPct,
+        arvSpread,
+        arvSpreadPct,
+        allInBasis,
+        allInToArvPct,
+        padsplitUpside,
+        padsplitUpsidePct
+    };
+}
+
+function attachPadsplitDebtView(candidate, ctx) {
+    const noi = num(ctx.padsplitEcon.noi || 0);
+    const grossRentMonthly = num(ctx.padsplitEcon.grossRentMonthly || 0);
+    const monthlyOpex = num(ctx.padsplitEcon.monthlyOpex || 0);
+    const monthlyPI = num(candidate.combinedMonthlyPI || 0);
+    const annualDebtService = round(monthlyPI * 12, 0);
+
+    const padsplitAnnualCF = round(noi - annualDebtService, 0);
+    const padsplitMonthlyCF = round(padsplitAnnualCF / 12, 0);
+    const padsplitDSCR = annualDebtService > 0 ? round(noi / annualDebtService, 2) : 0;
+    const padsplitCoC = num(candidate.totalIn) > 0 ? round((padsplitAnnualCF / num(candidate.totalIn)) * 100, 1) : 0;
+
+    const padsplitBreakEvenRent = round(monthlyPI + monthlyOpex, 2);
+    const padsplitRentGap = round(padsplitBreakEvenRent - grossRentMonthly, 2);
+    const padsplitRentGapPct = grossRentMonthly > 0 ? round((padsplitRentGap / grossRentMonthly) * 100, 1) : 0;
+
+    return {
+        ...candidate,
+        padsplitAnnualCF,
+        padsplitMonthlyCF,
+        padsplitDSCR,
+        padsplitCoC,
+        padsplitBreakEvenRent,
+        padsplitRentGap,
+        padsplitRentGapPct
+    };
+}
+
+function evaluateCashflowMandate(candidate, policy) {
+    const p = policy.mandates.cashflow;
+    const hardFails = [];
+    const softFails = [];
+
+    if (candidate.DSCR < policy.target_dscr) hardFails.push('DSCR_BELOW_1_28_TARGET');
+    if (candidate.monthlyCF < p.min_monthly_cf_hard) hardFails.push('MONTHLY_CF_HARD_FAIL');
+    if (candidate.entryPct > p.max_entry_pct) hardFails.push('ENTRY_TOO_HIGH');
+
+    if (candidate.monthlyCF < p.min_monthly_cf_target) softFails.push('MONTHLY_CF_BELOW_TARGET');
+
+    if (candidate.coc < p.min_coc_target) {
+        if (candidate.DSCR >= policy.target_dscr && candidate.monthlyCF >= p.min_monthly_cf_target) {
+            softFails.push('COC_BELOW_TARGET_BUT_DSCR_PASS');
+        } else {
+            softFails.push('COC_BELOW_TARGET');
+        }
+    }
+
+    const fatalSoftFails = softFails.filter(reason => reason !== 'COC_BELOW_TARGET_BUT_DSCR_PASS');
+
+    return {
+        pass: hardFails.length === 0 && fatalSoftFails.length === 0,
+        hard_fail_reasons: hardFails,
+        soft_fail_reasons: softFails
+    };
+}
+
+function evaluateBrrrrMandate(candidate, policy) {
+    const p = policy.mandates.brrrr;
+    const hardFails = [];
+    const softFails = [];
+
+    if (candidate.DSCR < p.min_dscr_hard) hardFails.push('DSCR_TOO_LOW_FOR_BRRRR');
+    if (candidate.monthlyCF < p.min_monthly_cf_hard) hardFails.push('MONTHLY_CF_TOO_NEGATIVE_FOR_BRRRR');
+    if (candidate.entryPct > p.max_entry_pct) hardFails.push('ENTRY_TOO_HIGH_FOR_BRRRR');
+    if (candidate.instantEquityPct < p.min_instant_equity_pct) softFails.push('INSTANT_EQUITY_TOO_LOW');
+    if (candidate.arvSpreadPct < p.min_arv_spread_pct) softFails.push('ARV_SPREAD_TOO_LOW');
+    if (candidate.allInToArvPct > p.max_all_in_to_arv_pct) softFails.push('ALL_IN_BASIS_TOO_HIGH');
+
+    return {
+        pass: hardFails.length === 0 && softFails.length === 0,
+        hard_fail_reasons: hardFails,
+        soft_fail_reasons: softFails
+    };
+}
+
+function evaluatePadsplitMandate(candidate, ctx, policy) {
+    const p = policy.mandates.padsplit;
+    const hardFails = [];
+    const softFails = [];
+
+    if (p.require_padsplit_viable && !ctx.input.padsplit.feasible) hardFails.push('PADSPLIT_NOT_FEASIBLE_UPSTREAM');
+    if (ctx.padsplitEcon.grossRentMonthly <= 0) hardFails.push('NO_PADSPLIT_RENT_MODEL');
+    if (candidate.padsplitDSCR < p.min_dscr_hard) hardFails.push('PADSPLIT_DSCR_HARD_FAIL');
+    if (candidate.padsplitMonthlyCF < p.min_monthly_cf_hard) hardFails.push('PADSPLIT_CF_HARD_FAIL');
+    if (candidate.entryPct > p.max_entry_pct) hardFails.push('ENTRY_TOO_HIGH');
+    if (candidate.padsplitDSCR < p.min_dscr_target) softFails.push('PADSPLIT_DSCR_BELOW_TARGET');
+    if (candidate.padsplitMonthlyCF < p.min_monthly_cf_target) softFails.push('PADSPLIT_CF_BELOW_TARGET');
+    if (candidate.padsplitCoC < p.min_coc_target) softFails.push('PADSPLIT_COC_BELOW_TARGET');
+    if (candidate.padsplitUpside <= 0) softFails.push('NO_PADSPLIT_UPSIDE');
+
+    return {
+        pass: hardFails.length === 0 && softFails.length === 0,
+        hard_fail_reasons: hardFails,
+        soft_fail_reasons: softFails
+    };
+}
+
+function evaluateMandates(candidate, ctx, policy) {
+    let enriched = attachMandateMetrics(candidate, ctx);
+    enriched = attachPadsplitDebtView(enriched, ctx);
+
+    const mandate_results = {
+        cashflow: evaluateCashflowMandate(enriched, policy),
+        brrrr: evaluateBrrrrMandate(enriched, policy),
+        padsplit: evaluatePadsplitMandate(enriched, ctx, policy)
+    };
+
+    const viable_for = Object.entries(mandate_results)
+        .filter(([, result]) => result.pass)
+        .map(([name]) => name);
+
+    return { ...enriched, mandate_results, viable_for };
+}
+
+function boundedScore(value, min, target, max = null) {
+    const v = Number(value) || 0;
+    if (v <= min) return 0;
+    if (max !== null && v >= max) return 100;
+    if (v >= target) return 100;
+    if (target === min) return 100;
+    return Math.max(0, Math.min(100, ((v - min) / (target - min)) * 100));
+}
+
+function inverseScore(value, target, hardMax) {
+    const v = Number(value) || 0;
+    if (v <= target) return 100;
+    if (v >= hardMax) return 0;
+    return Math.max(0, Math.min(100, 100 - ((v - target) / (hardMax - target)) * 100));
+}
+
+function complexityScore(candidate) {
+    if (candidate.family === 'seller_finance') return 85;
+    if (candidate.family === 'subto') return 70;
+    if (candidate.family === 'hybrid') return 60;
+    return 50;
+}
+
+function confidenceScore(candidate) {
+    let score = 80;
+    if (!candidate.pass) score -= 25;
+    if (candidate.forcedFallback) score -= 30;
+    if ((candidate.hard_fail_reasons || []).length) score -= 30;
+    const fatalSofts = (candidate.soft_fail_reasons || []).filter(r => r !== 'COC_BELOW_TARGET_BUT_DSCR_PASS');
+    if (fatalSofts.length) score -= 10;
+    if (Math.abs(num(candidate.purchaseGap)) > 0) score -= 40;
+    return Math.max(0, Math.min(100, score));
+}
+
+function rankCandidate(candidate, profile) {
+    const mandate = profile.mandate || 'cashflow';
+    const mandateResult = candidate.mandate_results?.[mandate];
+
+    const scorecard = {
+        dscr: boundedScore(mandate === 'padsplit' ? candidate.padsplitDSCR : candidate.DSCR, 0.8, 1.27),
+        cashFlow: boundedScore(mandate === 'padsplit' ? candidate.padsplitMonthlyCF : candidate.monthlyCF, -100, 300),
+        coc: boundedScore(mandate === 'padsplit' ? candidate.padsplitCoC : candidate.coc, 0, 15),
+        entry: inverseScore(candidate.entryPct, 10, 25),
+        complexity: complexityScore(candidate),
+        confidence: confidenceScore({
+            ...candidate,
+            hard_fail_reasons: mandateResult?.hard_fail_reasons || [],
+            soft_fail_reasons: mandateResult?.soft_fail_reasons || [],
+            pass: !!mandateResult?.pass
+        }),
+        instantEquity: boundedScore(candidate.instantEquityPct || 0, 0, 12, 25),
+        arvSpread: boundedScore(candidate.arvSpreadPct || 0, 0, 20, 35),
+        padsplitUpside: boundedScore(candidate.padsplitUpsidePct || 0, 0, 25, 60)
+    };
+
+    const w = profile.weights;
+    const weightedScore =
+        scorecard.dscr * (w.dscr || 0) +
+        scorecard.cashFlow * (w.cashFlow || 0) +
+        scorecard.coc * (w.coc || 0) +
+        scorecard.entry * (w.entry || 0) +
+        scorecard.complexity * (w.complexity || 0) +
+        scorecard.confidence * (w.confidence || 0) +
+        scorecard.instantEquity * (w.instantEquity || 0) +
+        scorecard.arvSpread * (w.arvSpread || 0) +
+        scorecard.padsplitUpside * (w.padsplitUpside || 0);
+
+    return { weightedScore: round(weightedScore, 2), scorecard };
+}
+
+function sortCandidates(candidates, profile) {
+    return [...candidates]
+        .map(candidate => {
+            const rank = rankCandidate(candidate, profile);
+            return { ...candidate, weightedScore: rank.weightedScore, scorecard: rank.scorecard };
+        })
+        .sort((a, b) => {
+            if (b.pass !== a.pass) return Number(b.pass) - Number(a.pass);
+            if (a.forcedFallback !== b.forcedFallback) return Number(a.forcedFallback) - Number(b.forcedFallback);
+            if (b.weightedScore !== a.weightedScore) return b.weightedScore - a.weightedScore;
+            const bDSCR = mandateDSCR(b, profile);
+            const aDSCR = mandateDSCR(a, profile);
+            const bCF = mandateMonthlyCF(b, profile);
+            const aCF = mandateMonthlyCF(a, profile);
+            const bCoC = mandateCoC(b, profile);
+            const aCoC = mandateCoC(a, profile);
+            if (bDSCR !== aDSCR) return bDSCR - aDSCR;
+            if (bCF !== aCF) return bCF - aCF;
+            if (bCoC !== aCoC) return bCoC - aCoC;
+            if (a.totalIn !== b.totalIn) return a.totalIn - b.totalIn;
+            return String(a.id).localeCompare(String(b.id));
+        });
+}
+
+function qualityTier(candidate, profile) {
+    if (!candidate) return 'non_marketable';
+    if (candidate.forcedFallback) return 'non_marketable';
+    if (Math.abs(num(candidate.purchaseGap)) > 0) return 'speculative';
+
+    const mandate = profile?.mandate || 'cashflow';
+    const result = candidate.mandate_results?.[mandate];
+
+    if (mandate === 'brrrr') {
+        if (!result?.pass) return 'speculative';
+        if (candidate.instantEquityPct >= 20 && candidate.allInToArvPct <= 0.75) return 'brrrr_grade';
+        return 'value_add_grade';
+    }
+
+    if (mandate === 'padsplit') {
+        if (!result?.pass) return 'speculative';
+        if (candidate.padsplitUpsidePct >= 25) return 'padsplit_grade';
+        return 'alternative_rent_grade';
+    }
+
+    if (!result?.pass) return 'speculative';
+    if (candidate.DSCR >= 1.35 && candidate.monthlyCF >= 400 && candidate.coc >= 15) return 'institutional_grade';
+    if (candidate.DSCR >= 1.27 && candidate.monthlyCF >= 200) return 'investor_grade';
+    if (candidate.DSCR >= 1.27 && candidate.monthlyCF >= 0) return 'thin_margin';
+    return 'speculative';
+}
+
+function sellerFacingAllowed(candidate, validation, policy, profile) {
+    if (!candidate) return false;
+    if (!validation.valid) return false;
+    if (candidate.forcedFallback && !policy.fallback.seller_facing_allowed) return false;
+    if (Math.abs(num(candidate.purchaseGap)) > 0) return false;
+
+    const mandate = profile?.mandate || 'cashflow';
+    const mandateResult = candidate.mandate_results?.[mandate];
+    if (!mandateResult?.pass) return false;
+
+    const tier = qualityTier(candidate, profile);
+    return [
+        'institutional_grade',
+        'investor_grade',
+        'thin_margin',
+        'brrrr_grade',
+        'value_add_grade',
+        'padsplit_grade',
+        'alternative_rent_grade'
+    ].includes(tier);
+}
+
+function candidateEconomicSignature(c) {
+    if (!c) return '';
+    return [
+        c.family,
+        c.strategy,
+        Math.round(num(c.purchasePrice)),
+        Math.round(num(c.downPayment || 0)),
+        Math.round(num(c.cts || 0)),
+        Math.round(num(c.sellerCarryPrincipal || 0)),
+        round(num(c.sellerCarryRate || 0), 2),
+        Math.round(num(c.combinedMonthlyPI || 0))
+    ].join('|');
+}
+
+function backupDifferenceScore(primary, candidate) {
+    if (!primary || !candidate) return 0;
+
+    let score = 0;
+
+    if (candidate.family !== primary.family) score += 100;
+    if (candidate.strategy !== primary.strategy) score += 40;
+    if (Math.round(num(candidate.purchasePrice)) !== Math.round(num(primary.purchasePrice))) score += 35;
+    if (Math.round(num(candidate.downPayment || 0)) !== Math.round(num(primary.downPayment || 0))) score += 25;
+    if (Math.round(num(candidate.cts || 0)) !== Math.round(num(primary.cts || 0))) score += 25;
+    if (round(num(candidate.sellerCarryRate || 0), 2) !== round(num(primary.sellerCarryRate || 0), 2)) score += 20;
+    if (Math.round(num(candidate.combinedMonthlyPI || 0)) !== Math.round(num(primary.combinedMonthlyPI || 0))) score += 20;
+
+    if (num(candidate.sellerCarryBalloonYears) !== num(primary.sellerCarryBalloonYears)) score += 2;
+
+    if (candidate.DSCR > primary.DSCR) score += 20;
+    if (candidate.monthlyCF > primary.monthlyCF) score += 20;
+    if (candidate.coc > primary.coc) score += 15;
+    if (candidate.totalIn < primary.totalIn) score += 10;
+
+    return score;
+}
+
+function hasBlockingOfferIssue(candidate, policy, profile) {
+  if (!candidate) return true;
+
+  const tolerance = num(policy?.structure?.purchase_gap_tolerance || 2500);
+  const hardFails = candidate.hard_fail_reasons || [];
+  const selectedDSCR = mandateDSCR(candidate, profile);
+  const requiredDSCR = (profile?.mandate || 'cashflow') === 'padsplit'
+    ? num(policy?.mandates?.padsplit?.min_dscr_target || 1.80)
+    : num(policy?.target_dscr || 1.28);
+
+  if (candidate.forcedFallback) return true;
+  if (hardFails.length > 0) return true;
+  if (selectedDSCR < requiredDSCR) return true;
+  if (Math.abs(num(candidate.purchaseGap)) > tolerance) return true;
+
+  if (
+    candidate.family === 'subto' &&
+    num(candidate.unresolvedEquity) > tolerance
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isSellerFacingCandidate(candidate, profile, policy) {
+  if (hasBlockingOfferIssue(candidate, policy, profile)) return false;
+
+  const mandate = profile?.mandate || 'cashflow';
+  const result = candidate.mandate_results?.[mandate];
+
+  if (!result?.pass) return false;
+  if ((result.hard_fail_reasons || []).length > 0) return false;
+
+  return true;
+}
+
+function selectCandidates(candidates, routing, profile, policy) {
+  const p = policy || defaultPolicy;
+  const targetDSCR = (profile?.mandate || 'cashflow') === 'padsplit' ? num(p.mandates?.padsplit?.min_dscr_target || 1.80) : num(p.target_dscr || 1.28);
+  const tolerance = num(p.structure?.purchase_gap_tolerance || 2500);
+
+  function isRealOffer(c) {
+    if (!c) return false;
+    if (c.forcedFallback) return false;
+    if ((c.hard_fail_reasons || []).length > 0) return false;
+    if (mandateDSCR(c, profile) < targetDSCR) return false;
+    if (Math.abs(num(c.purchaseGap)) > tolerance) return false;
+
+    const mandate = profile?.mandate || 'cashflow';
+    const mandateResult = c.mandate_results?.[mandate];
+
+    if (!mandateResult?.pass) return false;
+    if ((mandateResult.hard_fail_reasons || []).length > 0) return false;
+
+    return true;
+  }
+
+  function structurallyDifferent(a, b) {
+    if (!a || !b) return false;
+
+    if (a.family !== b.family) return true;
+    if (a.strategy !== b.strategy) return true;
+
+    if (Math.round(num(a.purchasePrice)) !== Math.round(num(b.purchasePrice))) return true;
+    if (Math.round(num(a.downPayment || 0)) !== Math.round(num(b.downPayment || 0))) return true;
+    if (Math.round(num(a.cts || 0)) !== Math.round(num(b.cts || 0))) return true;
+    if (Math.round(num(a.sellerCarryPrincipal || 0)) !== Math.round(num(b.sellerCarryPrincipal || 0))) return true;
+    if (round(num(a.sellerCarryRate || 0), 2) !== round(num(b.sellerCarryRate || 0), 2)) return true;
+    if (Math.round(num(a.combinedMonthlyPI || 0)) !== Math.round(num(b.combinedMonthlyPI || 0))) return true;
+
+    // Balloon-only difference is NOT enough.
+    return false;
+  }
+
+  const eligible = sortCandidates(candidates.filter(isRealOffer), profile);
+
+  const primaryPool = eligible.filter(c => c.family === routing.primary);
+  const secondaryPool = eligible.filter(c => routing.secondary.includes(c.family));
+
+  const primary = primaryPool[0] || secondaryPool[0] || eligible[0] || null;
+
+  if (!primary) {
+    const diagnosticPool = sortCandidates(candidates, profile);
+    return {
+      primary: diagnosticPool[0] || null,
+      backup: null
+    };
+  }
+
+  const backupPool = sortCandidates(
+    eligible.filter(c => {
+      if (c.id === primary.id) return false;
+      return structurallyDifferent(primary, c);
+    }),
+    profile
+  );
+
+  return {
+    primary,
+    backup: backupPool[0] || null
+  };
+}
+
+function summarizeDecision(primary, backup, routing) {
+    return {
+        winning_strategy: primary?.strategy || null,
+        winner_id: primary?.id || null,
+        backup_id: backup?.id || null,
+        why_winner_won: primary ? [
+            primary.pass ? 'PASSED_SELECTED_MANDATE' : 'BEST_AVAILABLE',
+            `PRIMARY_FAMILY_${routing.primary}`,
+            `VIABLE_FOR_${(primary.viable_for || []).join('_') || 'none'}`
+        ] : [],
+        routing_reason: routing.reason
+    };
+}
+
+function formatOffer(candidate, econ, label, mandate) {
+    if (!candidate) {
+        return {
+            Type: 'No viable creative offer',
+            offer_type: 'No viable creative offer',
+            raw: null,
+            viable_for: [],
+            cts: null,
+            cts_pct: null,
+            down_payment: null,
+            down_payment_pct: null,
+            existing_loan_balance: null,
+            existing_loan_rate: null,
+            existing_loan_monthly_pi: null,
+            seller_carry_principal: null,
+            seller_carry_rate: null,
+            seller_carry_amort_years: null,
+            seller_carry_balloon_years: null,
+            seller_carry_monthly_pi: null,
+            combined_monthly_pi: null,
+            funded_amount: null,
+            purchase_gap: null,
+            total_entry_fee: null,
+            'Purchase Price': 'N/A',
+            'Cash to Seller': 'N/A',
+            'Requested Price': 'N/A',
+            'Target DSCR': '1.28',
+            'DSCR-Adjusted Price': 'N/A',
+            'Price Adjusted for DSCR': false,
+            'Down Payment ($)': 'N/A',
+            'Down Payment (%)': 'N/A',
+            'Interest Rate (%)': 'N/A',
+            'Amortization (Years)': null,
+            'Balloon Term (Years)': null,
+            'Monthly Payment (PI)': 'N/A',
+            'Monthly Taxes and Insurance (TI)': money(econ.tiMonthly, 2),
+            ADS: 'N/A',
+            DSCR: 'N/A',
+            'Monthly Cash-flow': 'N/A',
+            'Annual Cash-flow': 'N/A',
+            'Break-even Rent': 'N/A',
+            'Rent Gap to Break-even': 'N/A',
+            'Cash-on-Cash Return': 'N/A',
+            'Funded Amount': 'N/A',
+            'Purchase Gap': 'N/A',
+            'Total Entry Fee': 'N/A',
+            'Years to Recapture Cash In': 'N/A',
+            'Cash Flow Profile': 'N/A',
+            'Instant Equity (%)': 'N/A',
+            'ARV Spread (%)': 'N/A',
+            'Padsplit Upside (%)': 'N/A',
+            'Deal Viable': false,
+            'Forced Fallback': false,
+            Justification: `${label} not available under current metrics.`
+        };
+    }
+
+    const usePadsplit = mandate === 'padsplit';
+    const breakEvenRent = usePadsplit ? candidate.padsplitBreakEvenRent : candidate.breakEvenRent;
+    const rentGap = usePadsplit ? candidate.padsplitRentGap : candidate.rentGap;
+
+    return {
+        Type: candidate.type,
+        offer_type: candidate.type,
+        raw: candidate,
+        viable_for: candidate.viable_for || [],
+        cts: moneyOrNull(candidate.cts),
+        cts_pct: pctOrNull(candidate.ctsPct, 2),
+        down_payment: moneyOrNull(candidate.downPayment),
+        down_payment_pct: pctOrNull(candidate.downPaymentPct, 2),
+        existing_loan_balance: moneyOrNull(candidate.existingLoanBalance),
+        existing_loan_rate: candidate.existingLoanRate != null ? String(candidate.existingLoanRate) : null,
+        existing_loan_monthly_pi: moneyOrNull(candidate.existingLoanMonthlyPI, 2),
+        seller_carry_principal: moneyOrNull(candidate.sellerCarryPrincipal),
+        seller_carry_rate: candidate.sellerCarryRate != null ? String(candidate.sellerCarryRate) : null,
+        seller_carry_amort_years: candidate.sellerCarryAmortYears ?? null,
+        seller_carry_balloon_years: candidate.sellerCarryBalloonYears ?? null,
+        seller_carry_monthly_pi: moneyOrNull(candidate.sellerCarryMonthlyPI, 2),
+        combined_monthly_pi: moneyOrNull(candidate.combinedMonthlyPI, 2),
+        funded_amount: moneyOrNull(candidate.fundedAmount),
+        purchase_gap: moneyOrNull(candidate.purchaseGap),
+        total_entry_fee: moneyOrNull(candidate.totalIn),
+        'Purchase Price': money(candidate.purchasePrice),
+        'Cash to Seller': money(candidate.cashToSeller || 0),
+        'Requested Price': money(candidate.requestedPrice || candidate.purchasePrice),
+        'Target DSCR': candidate.targetDSCR ? String(candidate.targetDSCR) : '1.27',
+        'DSCR-Adjusted Price': money(candidate.dscrAdjustedPrice || candidate.purchasePrice),
+        'Price Adjusted for DSCR': !!candidate.priceAdjustedForDSCR,
+        'Down Payment ($)': candidate.downPayment != null ? money(candidate.downPayment) : 'N/A',
+        'Down Payment (%)': candidate.downPaymentPct != null ? pct(candidate.downPaymentPct, 1) : 'N/A',
+        'CTS ($)': candidate.cts != null ? money(candidate.cts) : 'N/A',
+        'CTS (%)': candidate.ctsPct != null ? pct(candidate.ctsPct, 1) : 'N/A',
+        'Interest Rate (%)': candidate.sellerCarryRate != null ? String(candidate.sellerCarryRate) : (candidate.existingLoanRate != null ? String(candidate.existingLoanRate) : 'N/A'),
+        'Amortization (Years)': candidate.sellerCarryAmortYears || null,
+        'Balloon Term (Years)': candidate.sellerCarryBalloonYears || null,
+        'Monthly Payment (PI)': money(candidate.combinedMonthlyPI || 0, 2),
+        'Monthly Taxes and Insurance (TI)': money(econ.tiMonthly, 2),
+        ADS: money(candidate.ADS || 0),
+        DSCR: round(usePadsplit ? candidate.padsplitDSCR : candidate.DSCR, 2).toFixed(2),
+        'Monthly Cash-flow': money(usePadsplit ? candidate.padsplitMonthlyCF : candidate.monthlyCF),
+        'Annual Cash-flow': money(usePadsplit ? candidate.padsplitAnnualCF : candidate.annualCF),
+        'Break-even Rent': money(breakEvenRent || 0, 2),
+        'Rent Gap to Break-even': money(rentGap || 0, 2),
+        'Cash-on-Cash Return': pct(usePadsplit ? candidate.padsplitCoC : candidate.coc, 1),
+        'Funded Amount': money(candidate.fundedAmount || 0),
+        'Purchase Gap': money(candidate.purchaseGap || 0),
+        'Total Entry Fee': money(candidate.totalIn || 0),
+        'Years to Recapture Cash In': candidate.paybackYears != null ? String(candidate.paybackYears) : 'N/A',
+        'Cash Flow Profile': candidate.cashFlowProfile || 'N/A',
+        'Instant Equity (%)': pct(candidate.instantEquityPct || 0, 1),
+        'ARV Spread (%)': pct(candidate.arvSpreadPct || 0, 1),
+        'Padsplit Upside (%)': pct(candidate.padsplitUpsidePct || 0, 1),
+        'Deal Viable': !!candidate.pass,
+        'Forced Fallback': !!candidate.forcedFallback,
+        Justification: candidate.pass
+            ? `Selected structure passed current ${mandate} mandate.`
+            : candidate.forcedFallback
+                ? 'Educational fallback only. Not seller-facing under current policy.'
+                : `Best available structure, but not fully compliant with current ${mandate} mandate.`
+    };
+}
+
+const items = $input.all();
+const results = [];
+
+for (const item of items) {
+    try {
+        const root = item.json || {};
+        const profileName = inferProfileName(root);
+        const profile = investorProfiles[profileName] || investorProfiles.balanced;
+
+        const policy = deepClone(defaultPolicy);
+        const policyOverride = root.offer_policy || root.output?.offer_policy || {};
+
+        if (policyOverride.families) {
+            policy.families = { ...policy.families, ...policyOverride.families };
+            if (policyOverride.families.subto) policy.families.subto = { ...defaultPolicy.families.subto, ...policyOverride.families.subto };
+            if (policyOverride.families.hybrid) policy.families.hybrid = { ...defaultPolicy.families.hybrid, ...policyOverride.families.hybrid };
+            if (policyOverride.families.seller_finance) policy.families.seller_finance = { ...defaultPolicy.families.seller_finance, ...policyOverride.families.seller_finance };
+        }
+
+        if (policyOverride.mandates) {
+            policy.mandates = { ...policy.mandates, ...policyOverride.mandates };
+            if (policyOverride.mandates.cashflow) policy.mandates.cashflow = { ...defaultPolicy.mandates.cashflow, ...policyOverride.mandates.cashflow };
+            if (policyOverride.mandates.brrrr) policy.mandates.brrrr = { ...defaultPolicy.mandates.brrrr, ...policyOverride.mandates.brrrr };
+            if (policyOverride.mandates.padsplit) policy.mandates.padsplit = { ...defaultPolicy.mandates.padsplit, ...policyOverride.mandates.padsplit };
+        }
+
+        if (policyOverride.economics) policy.economics = { ...defaultPolicy.economics, ...policyOverride.economics };
+        if (policyOverride.structure) policy.structure = { ...defaultPolicy.structure, ...policyOverride.structure };
+        if (policyOverride.fallback) policy.fallback = { ...defaultPolicy.fallback, ...policyOverride.fallback };
+        if (policyOverride.output) policy.output = { ...defaultPolicy.output, ...policyOverride.output };
+        if (policyOverride.target_dscr) policy.target_dscr = num(policyOverride.target_dscr);
+        if (policyOverride.target_dscr_solve_buffer) policy.target_dscr_solve_buffer = num(policyOverride.target_dscr_solve_buffer);
+
+        const input = normalizeInput(root, policy);
+
+        if (
+            input.padsplit.targetRooms > 0 &&
+            input.padsplit.standardRoomCount === 0 &&
+            input.padsplit.ensuiteRoomCount === 0
+        ) {
+            input.padsplit.standardRoomCount = input.padsplit.targetRooms;
+        }
+
+        const validation = validateCanonicalInput(input);
+        const econ = computeEconomics(input, policy);
+        const padsplitEcon = computePadsplitEconomics(input, policy);
+        const equityPct = computeEquityPct(input.metrics_raw.equity_pct, input.debt.balance, input.property.asIsValue, input.debt.ltv);
+        const routing = routeFamilies(input.debt.balance, equityPct);
+        const cts = computeCTS(input, policy);
+        const cash = computeCashOffer(input, policy);
+
+        const ctx = { input, econ, padsplitEcon, policy, cts, cash, profile };
+
+        const rawCandidates = [
+            ...buildSellerFinanceCandidates(ctx),
+            ...buildSubToCandidates(ctx),
+            ...buildHybridCandidates(ctx)
+        ];
+
+        const fallbackCandidates = buildForcedFallbackCandidates(ctx);
+
+        const allCandidates = [...rawCandidates, ...fallbackCandidates].map(candidate => {
+            const structurallyValid = enforceStructureIntegrity(candidate, policy);
+            const evaluated = evaluateMandates(structurallyValid, ctx, policy);
+            const selectedMandate = profile.mandate || 'cashflow';
+            const selected = evaluated.mandate_results[selectedMandate] || {
+                pass: false,
+                hard_fail_reasons: [],
+                soft_fail_reasons: []
+            };
+
+            const fatalSoftFails = (selected.soft_fail_reasons || []).filter(r => r !== 'COC_BELOW_TARGET_BUT_DSCR_PASS');
+
+            const combinedHardFails = [
+                ...(evaluated.hard_fail_reasons || []),
+                ...(selected.hard_fail_reasons || [])
+            ];
+
+            const combinedSoftFails = [
+                ...(evaluated.soft_fail_reasons || []),
+                ...(selected.soft_fail_reasons || [])
+            ];
+
+            return {
+                ...evaluated,
+                hard_fail_reasons: [...new Set(combinedHardFails)],
+                soft_fail_reasons: [...new Set(combinedSoftFails)],
+                pass: [...new Set(combinedHardFails)].length === 0 && fatalSoftFails.length === 0 && !!selected.pass
+            };
+        });
+
+        const { primary, backup } = selectCandidates(allCandidates, routing, profile, policy);
+        const primaryQuality = qualityTier(primary, profile);
+        const backupQuality = qualityTier(backup, profile);
+        const sellerFacing = sellerFacingAllowed(primary, validation, policy, profile);
+
+        const normalizedMetrics = {
+            ...input.metrics_raw,
+            list_price: input.property.listPrice,
+            price: input.property.listPrice || num(input.metrics_raw.price),
+            as_is_value: input.property.asIsValue,
+            arv: input.property.arv,
+            grossRent: econ.rentMonthly,
+            standardGrossRent: econ.rentMonthly,
+            padsplitGrossRent: padsplitEcon.grossRentMonthly,
+            padsplitUpliftMonthly: Math.max(padsplitEcon.grossRentMonthly - econ.rentMonthly, 0),
+            padsplitUpliftPct: econ.rentMonthly > 0 ? round((Math.max(padsplitEcon.grossRentMonthly - econ.rentMonthly, 0) / econ.rentMonthly) * 100, 1) : 0,
+            annualRent: econ.annualRent,
+            taxes: econ.taxes,
+            insurance: econ.insurance,
+            mgmt: econ.mgmt,
+            maint: econ.maint,
+            vacancy: econ.vacancy,
+            utilities: econ.utilities,
+            opex: econ.opexAnnual,
+            noi: econ.noi,
+            tiMonthly: round(econ.tiMonthly, 2),
+            monthly_opex: round(econ.monthlyOpex, 2),
+            equity_pct: round(equityPct, 2)
+        };
+
+        const normalizedLoan = {
+            ...input.existing_loan_raw,
+            balance: input.debt.balance,
+            sellerMonthlyPaymentPI: round(input.debt.monthlyPI, 2),
+            rate: input.debt.ratePct,
+            original_principal: input.debt.originalPrincipal
+        };
+
+        const selectedGrossRentMonthly = profile.mandate === 'padsplit' ? padsplitEcon.grossRentMonthly : econ.rentMonthly;
+        const selectedAnnualRent = profile.mandate === 'padsplit' ? padsplitEcon.annualRent : econ.annualRent;
+        const selectedOpexAnnual = profile.mandate === 'padsplit' ? padsplitEcon.opexAnnual : econ.opexAnnual;
+        const selectedNOI = profile.mandate === 'padsplit' ? padsplitEcon.noi : econ.noi;
+        const selectedDSCR = profile.mandate === 'padsplit' ? (primary?.padsplitDSCR || 0) : (primary?.DSCR || 0);
+        const selectedMonthlyCF = profile.mandate === 'padsplit' ? (primary?.padsplitMonthlyCF || 0) : (primary?.monthlyCF || 0);
+        const selectedAnnualCF = profile.mandate === 'padsplit' ? (primary?.padsplitAnnualCF || 0) : (primary?.annualCF || 0);
+        const selectedBreakEvenRent = profile.mandate === 'padsplit' ? (primary?.padsplitBreakEvenRent || 0) : (primary?.breakEvenRent || 0);
+        const selectedRentGap = profile.mandate === 'padsplit' ? (primary?.padsplitRentGap || 0) : (primary?.rentGap || 0);
+        const selectedCoC = profile.mandate === 'padsplit' ? (primary?.padsplitCoC || 0) : (primary?.coc || 0);
+
+        const rule2 = primary?.purchasePrice > 0 && selectedGrossRentMonthly > 0
+            ? (selectedGrossRentMonthly / primary.purchasePrice >= 0.02 ? '✅' : '❌')
+            : '❌';
+
+        const rule50 = selectedAnnualRent > 0
+            ? (selectedOpexAnnual <= selectedAnnualRent * 0.5 ? '✅' : '❌')
+            : '❌';
+
+        const investorsAnalysis = {
+            'Gross Rent': money(selectedGrossRentMonthly),
+            'Annual Rent': money(selectedAnnualRent),
+            'Operating Expenses': money(selectedOpexAnnual),
+            NOI: money(selectedNOI),
+            'Annual Debt Service (ADS)': money(primary?.ADS || 0),
+            DSCR: round(selectedDSCR, 2).toFixed(2),
+            'Monthly Cash-flow': money(selectedMonthlyCF),
+            'Annual Cash-flow': money(selectedAnnualCF),
+            'Break-even Rent': money(selectedBreakEvenRent, 2),
+            'Rent Gap to Break-even': money(selectedRentGap, 2),
+            'Cash Flow Profile': primary?.cashFlowProfile || 'unknown',
+            'Years to Recapture Cash In': primary?.paybackYears != null ? String(primary.paybackYears) : 'N/A',
+            'Total Cash In': money(primary?.totalIn || 0),
+            'Cash-on-Cash Return': pct(selectedCoC, 1),
+            '2% Rule': rule2,
+            '50% Rule': rule50
+        };
+
+        const dealStructure = {
+            'Primary Offer': formatOffer(primary, econ, 'Primary Offer', profile.mandate),
+            'Backup Offer': formatOffer(backup, econ, 'Backup Offer', profile.mandate),
+            'Updated Cash Offer': {
+                'Final Cash Offer': money(cash.mao),
+                'Final Cash Offer % of ARV': `${cash.cashPctOfArv}% of ARV`,
+                'Cash Offer Table Used': cash.cash_offer.cash_offer_table,
+                'Base Cash Offer Before Repair Deduction': money(cash.cash_offer.base_cash_offer_before_repair_deduction),
+                'Repair Deduction Used': money(cash.repairDeductionUsed),
+                'Repair Deduction Reason': cash.cash_offer.repair_deduction_reason,
+                'Low Rehab Reference': money(cash.lowRehab),
+                'Medium Rehab Reference': money(cash.mediumRehab),
+                'Full Rehab Reference': money(cash.fullRehab),
+                'Buyer Acquisition Costs Reference': money(cash.buyerAcquisitionCostsReference),
+                'Seller Agent Fee Reference': money(cash.sellerAgentFeeReference),
+                'Seller Closing Costs Reference': money(cash.sellerClosingCostsReference),
+                'Closing Costs Included In MAO': false,
+                'Wholesale Fee Included In MAO': false,
+                Justification:
+                    `Cash MAO used your ARV table: ${cash.cash_offer.cash_offer_table}. ` +
+                    `Base cash offer is ${money(cash.cash_offer.base_cash_offer_before_repair_deduction)}. ` +
+                    `${cash.repairDeductionUsed > 0
+                        ? `Specific repair signal was found, so ${money(cash.repairDeductionUsed)} was deducted. `
+                        : 'No specific repair signal was found, so repairs were not deducted from MAO. '
+                    }` +
+                    `Buyer acquisition costs, seller agent fee, rehab scenarios, and wholesale fee are shown for closer reference only, not deducted from MAO.`
+            }
+        };
+
+        const cfForAssignment = profile.mandate === 'padsplit' ? primary?.padsplitMonthlyCF : primary?.monthlyCF;
+        const assignmentFeeRange = cfForAssignment >= 500
+            ? '$8,000–$15,000'
+            : cfForAssignment >= 200
+                ? '$5,000–$12,000'
+                : '$3,000–$7,500';
+
+        const engineStatus = {
+            version: ENGINE_VERSION,
+            status: validation.valid ? (primary?.pass ? 'viable' : primary ? 'fallback_only_or_thin' : 'no_structure') : 'insufficient_data',
+            seller_facing_allowed: sellerFacing,
+            quality_tier: primaryQuality,
+            backup_quality_tier: backupQuality,
+            profile: profile.name,
+            mandate: profile.mandate,
+            required_primary_family: routing.primary,
+            secondary_families: routing.secondary,
+            routing_confidence: routing.confidence,
+            primary_viable: !!primary?.pass,
+            backup_viable: !!backup?.pass,
+            forced_fallback_used: !!primary?.forcedFallback || !!backup?.forcedFallback,
+            data_quality_warning_count: validation.warnings.length,
+            data_quality_error_count: validation.errors.length
+        };
+
+        const canonical = {
+            economics_standard: {
+                grossRentMonthly: econ.rentMonthly,
+                annualRent: econ.annualRent,
+                opexAnnual: econ.opexAnnual,
+                NOI: econ.noi,
+                ADS: primary?.ADS || 0,
+                DSCR: round(primary?.DSCR || 0, 2),
+                monthlyCF: primary?.monthlyCF || 0,
+                annualCF: primary?.annualCF || 0,
+                breakEvenRentMonthly: round(primary?.breakEvenRent || 0, 2),
+                rentGapToBreakEven: round(primary?.rentGap || 0, 2),
+                totalCashIn: primary?.totalIn || 0,
+                CoC_pct: round(primary?.coc || 0, 1)
+            },
+            economics_selected_mandate: profile.mandate === 'padsplit'
+                ? {
+                    grossRentMonthly: padsplitEcon.grossRentMonthly,
+                    annualRent: padsplitEcon.annualRent,
+                    opexAnnual: padsplitEcon.opexAnnual,
+                    NOI: padsplitEcon.noi,
+                    ADS: primary?.ADS || 0,
+                    DSCR: round(primary?.padsplitDSCR || 0, 2),
+                    monthlyCF: primary?.padsplitMonthlyCF || 0,
+                    annualCF: primary?.padsplitAnnualCF || 0,
+                    breakEvenRentMonthly: round(primary?.padsplitBreakEvenRent || 0, 2),
+                    rentGapToBreakEven: round(primary?.padsplitRentGap || 0, 2),
+                    totalCashIn: primary?.totalIn || 0,
+                    CoC_pct: round(primary?.padsplitCoC || 0, 1)
+                }
+                : {
+                    grossRentMonthly: econ.rentMonthly,
+                    annualRent: econ.annualRent,
+                    opexAnnual: econ.opexAnnual,
+                    NOI: econ.noi,
+                    ADS: primary?.ADS || 0,
+                    DSCR: round(primary?.DSCR || 0, 2),
+                    monthlyCF: primary?.monthlyCF || 0,
+                    annualCF: primary?.annualCF || 0,
+                    breakEvenRentMonthly: round(primary?.breakEvenRent || 0, 2),
+                    rentGapToBreakEven: round(primary?.rentGap || 0, 2),
+                    totalCashIn: primary?.totalIn || 0,
+                    CoC_pct: round(primary?.coc || 0, 1)
+                },
+            mandates: {
+                cashflow: primary?.mandate_results?.cashflow || null,
+                brrrr: primary?.mandate_results?.brrrr || null,
+                padsplit: primary?.mandate_results?.padsplit || null
+            }
+        };
+
+        const decision = summarizeDecision(primary, backup, routing);
+        const sortedAllCandidates = sortCandidates(allCandidates, profile);
+
+        const mandateDiagnostics = {
+            selected_profile: profile.name,
+            selected_mandate: profile.mandate,
+            primary_viable_for: primary?.viable_for || [],
+            backup_viable_for: backup?.viable_for || [],
+            padsplit: {
+                feasible: input.padsplit.feasible,
+                allowed: input.padsplit.allowed,
+                standard_room_count: input.padsplit.standardRoomCount,
+                ensuite_room_count: input.padsplit.ensuiteRoomCount,
+                standard_room_rate: input.padsplit.standardRoomRate,
+                ensuite_room_rate: input.padsplit.ensuiteRoomRate,
+                gross_rent_monthly: padsplitEcon.grossRentMonthly,
+                annual_rent: padsplitEcon.annualRent,
+                opex_annual: padsplitEcon.opexAnnual,
+                noi: padsplitEcon.noi,
+                utilities_annual: padsplitEcon.utilities,
+                cleaning_annual: padsplitEcon.cleaning,
+                turn_reserve_annual: padsplitEcon.turnReserve
+            }
+        };
+
+        const offerEngineDebug = {
+            version: ENGINE_VERSION,
+            validation,
+            routing: {
+                equity_pct: equityPct,
+                primary_family: routing.primary,
+                secondary_families: routing.secondary,
+                confidence: routing.confidence,
+                reason: routing.reason
+            },
+            counts: {
+                seller_finance: rawCandidates.filter(c => c.family === 'seller_finance').length,
+                subto: rawCandidates.filter(c => c.family === 'subto').length,
+                hybrid: rawCandidates.filter(c => c.family === 'hybrid').length,
+                fallbacks: fallbackCandidates.length,
+                total: allCandidates.length
+            },
+            selected: {
+                primary_id: primary?.id || null,
+                backup_id: backup?.id || null,
+                primary_family: primary?.family || null,
+                backup_family: backup?.family || null,
+                primary_weighted_score: primary?.weightedScore ?? null,
+                backup_weighted_score: backup?.weightedScore ?? null,
+                backup_difference_score: backup?.backup_difference_score ?? null
+            },
+            mandate_diagnostics: mandateDiagnostics,
+            top_candidates: sortedAllCandidates.slice(0, 5),
+            decision
+        };
+
+        const passThroughConfig = {
+            closingCostRate: num(policy.economics.buyer_acquisition_cost_rate ?? policy.economics.closing_cost_rate ?? 0.05),
+            buyerAcquisitionCostRate: num(policy.economics.buyer_acquisition_cost_rate ?? policy.economics.closing_cost_rate ?? 0.05),
+            mgmtRate: policy.economics.mgmt_rate,
+            maintRate: policy.economics.maint_rate,
+            vacancyRate: policy.economics.vacancy_rate,
+            assignmentPctOfDown: policy.economics.assignment_pct_of_entry,
+            taxRate: 0.0115,
+            insuranceRate: 0.012,
+            targetDSCR: policy.target_dscr,
+            targetDSCRSolveBuffer: policy.target_dscr_solve_buffer,
+            economics: policy.economics,
+            structure: policy.structure,
+            mandates: policy.mandates
+        };
+
+        const buyerMatches =
+            Array.isArray(root.buyer_matches) ? root.buyer_matches :
+                Array.isArray(root.matches) ? root.matches :
+                    Array.isArray(root.output?.buyer_matches) ? root.output.buyer_matches :
+                        Array.isArray(root.output?.matches) ? root.output.matches :
+                            [];
+
+        const buyerMatchSummary =
+            root.buyer_match_summary ||
+            root.summary ||
+            root.output?.buyer_match_summary ||
+            root.output?.summary ||
+            '';
+
+        const compProperties =
+            Array.isArray(root.comp_properties_report) ? root.comp_properties_report :
+                Array.isArray(root.output?.comp_properties_report) ? root.output.comp_properties_report :
+                    [];
+
+        const compsSummary =
+            root.comps_summary ||
+            root.output?.comps_summary ||
+            '';
+
+        const locationContext =
+            root.location_context ||
+            root.output?.location_context ||
+            {};
+
+        const marketData =
+            root.market_data_trends ||
+            root.output?.market_data_trends ||
+            root.market_data_extracted ||
+            {};
+
+        const webhookCustomData =
+            root.webhook_custom_data ||
+            root.customData ||
+            root.body?.customData ||
+            root.body ||
+            {};
+
+        const warnings = Array.isArray(root.warnings) ? root.warnings : [];
+
+        const result = {
+            engine_status: engineStatus,
+            estimated_arv: input.property.arv,
+            comp_properties_report: compProperties,
+            comps_summary: compsSummary,
+
+            investors_analysis: investorsAnalysis,
+            investors_analysis_insights: primary
+                ? `${primary.type} is the current best path under ${profile.name}/${profile.mandate} underwriting. ` +
+                `Viable for: ${(primary.viable_for || []).join(', ') || 'none'}. ` +
+                `Quality tier is ${primaryQuality}.`
+                : 'No structure could be built from current inputs.',
+
+            deal_structure: dealStructure,
+            cash_offer: cash.cash_offer,
+            mao: cash.mao,
+            wholesale_fee: cash.wholesaleFee,
+            repair_estimate: cash.repairEstimate,
+            cts_engine: cts,
+            assignment_fee_range: assignmentFeeRange,
+
+            property: input.property_raw,
+            metrics: normalizedMetrics,
+            config: passThroughConfig,
+            existing_loan: normalizedLoan,
+            canonical,
+
+            normalized_subject: input.normalized_subject,
+            transcript: input.transcript,
+            output_transcript_raw: root.output || {},
+            location_context: locationContext,
+            market_data_trends: marketData,
+            webhook_custom_data: webhookCustomData,
+
+            buyer_matches: buyerMatches,
+            buyer_match_summary: buyerMatchSummary,
+            warnings,
+
+            mandate_diagnostics: mandateDiagnostics,
+            decision,
+            offer_engine_debug: policy.output.include_debug ? offerEngineDebug : undefined
+        };
+
+        result.output = {
+            ...result,
+            output: undefined
+        };
+        delete result.output.output;
+
+        if (!policy.output.include_debug) {
+            delete result.offer_engine_debug;
+            delete result.output.offer_engine_debug;
+        }
+
+        if (!policy.output.include_all_candidates && result.offer_engine_debug) {
+            delete result.offer_engine_debug.top_candidates;
+            delete result.output.offer_engine_debug.top_candidates;
+        }
+
+        results.push({ json: result });
+    } catch (e) {
+        results.push({
+            json: {
+                engine_status: {
+                    version: ENGINE_VERSION,
+                    status: 'error'
+                },
+                _error: e?.message || String(e),
+                _stack: e?.stack || null,
+                _input: item.json || {}
+            }
+        });
+    }
+}
+
+return results;
